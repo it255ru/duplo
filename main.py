@@ -29,7 +29,7 @@ import types
 from collections.abc import Callable, Iterable
 from typing import Optional
 
-__version__ = '0.3.0'
+__version__ = '0.3.1'
 
 _FILE_CATEGORIES_SPEC = {
     'images': {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp',
@@ -817,6 +817,20 @@ def _delete(args: argparse.Namespace, duplicates: DuplicateGroups,
     return 1 if apply_plan(plan, dry_run=args.dry_run) else 0
 
 
+def _tolerate_unencodable_output() -> None:
+    """Prevents crashes on names the output encoding cannot represent.
+
+    A redirected stdout on Windows uses the ANSI code page (e.g. cp1251),
+    which has no emoji and, on non-Russian systems, no Cyrillic. Such
+    characters are written as backslash escapes instead of raising
+    UnicodeEncodeError in the middle of a report or a deletion.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, 'reconfigure', None)
+        if reconfigure is not None:
+            reconfigure(errors='backslashreplace')
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     """Command-line entry point.
 
@@ -826,6 +840,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     Returns:
       Process exit code, see the module docstring.
     """
+    _tolerate_unencodable_output()
     args = build_parser().parse_args(argv)
     if not os.path.isdir(args.source_dir):
         print(f'Ошибка: каталог не найден: {safe_text(args.source_dir)}',
