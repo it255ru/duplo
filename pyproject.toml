@@ -1,0 +1,25 @@
+[project]
+name = "duplo"
+version = "0.3.1"
+description = "Find and safely remove duplicate files and directories"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+[tool.ruff]
+line-length = 80
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "N", "B", "UP", "SIM"]
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+files = ["main.py", "tools/check_invariants.py"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["test_main.py"]
