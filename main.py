@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import dataclasses
 import filecmp
 import hashlib
@@ -27,7 +28,6 @@ import tempfile
 import time
 import types
 from collections.abc import Callable, Iterable
-from typing import Optional
 
 __version__ = '0.3.1'
 
@@ -89,7 +89,7 @@ DirGroups = list[list[str]]
 """Groups of identical directories, each sorted, 2+ entries each."""
 Selection = tuple[list[str], list[str]]
 """(paths_to_delete, dirs_to_delete) before validation by build_plan."""
-KeepChoice = tuple[Optional[set[int]], bool]
+KeepChoice = tuple[set[int] | None, bool]
 """(kept indices or None to skip the group, apply_to_rest)."""
 
 
@@ -254,7 +254,7 @@ class HashCache:
         if isinstance(loaded, dict):
             self._data = loaded
 
-    def get(self, entry: FileEntry) -> Optional[str]:
+    def get(self, entry: FileEntry) -> str | None:
         record = self._data.get(_key(entry.path))
         if (isinstance(record, dict)
             and record.get('key') == [entry.size, entry.mtime_ns, entry.ino]):
@@ -276,16 +276,14 @@ class HashCache:
                 json.dump(self._data, f)
             os.replace(tmp, self._path)
         except BaseException:
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(tmp)
-            except OSError:
-                pass
             raise
 
 
 def find_duplicates(files: Iterable[FileEntry],
-                    cache: Optional[HashCache] = None,
-                    errors: Optional[list[str]] = None) -> DuplicateGroups:
+                    cache: HashCache | None = None,
+                    errors: list[str] | None = None) -> DuplicateGroups:
     """Groups non-empty regular files with identical content hashes.
 
     Hardlinks to one inode are reported once: deleting one of them frees no
@@ -337,7 +335,7 @@ def find_duplicates(files: Iterable[FileEntry],
 
 
 def _leaf_signature(dir_path: str,
-                    hash_by_key: dict[str, str]) -> Optional[tuple[str, ...]]:
+                    hash_by_key: dict[str, str]) -> tuple[str, ...] | None:
     """Returns sorted hashes of a leaf directory, or None if not eligible.
 
     Eligible: no subdirectories, no non-regular entries, every file is in a
@@ -397,7 +395,7 @@ def parse_keep_indices(answer: str, count: int) -> set[int]:
 
 
 def ask_keep(count: int,
-             read: Optional[Callable[[str], str]] = None) -> KeepChoice:
+             read: Callable[[str], str] | None = None) -> KeepChoice:
     """Asks which items of a group to keep until the answer is valid.
 
     Args:
@@ -434,7 +432,7 @@ _MENU = ('  [s] пропустить  [a] оставить первую  [b] о�
 
 
 def select_interactive(duplicates: DuplicateGroups, identical_dirs: DirGroups,
-                       read: Optional[Callable[[str], str]] = None
+                       read: Callable[[str], str] | None = None
                        ) -> Selection:
     """Interactively selects files and directories to delete.
 
@@ -529,7 +527,7 @@ def _parent_moved(path: str, plan: Plan) -> bool:
 
 
 def verify_before_delete(victim: FileEntry,
-                         keeper: FileEntry) -> Optional[str]:
+                         keeper: FileEntry) -> str | None:
     """Checks that victim is still a byte-identical copy of keeper.
 
     Returns:
@@ -831,7 +829,7 @@ def _tolerate_unencodable_output() -> None:
             reconfigure(errors='backslashreplace')
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     """Command-line entry point.
 
     Args:
