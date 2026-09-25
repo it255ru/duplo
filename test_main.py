@@ -3,6 +3,7 @@
 import os
 import pickle
 import stat
+import subprocess
 import sys
 
 import pytest
@@ -11,6 +12,10 @@ import main as duplo
 
 POSIX_ONLY = pytest.mark.skipif(sys.platform == 'win32',
                                 reason='symlink/FIFO need POSIX')
+WINDOWS_ONLY = pytest.mark.skipif(sys.platform != 'win32',
+                                  reason='Windows filesystem semantics')
+MAIN_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(duplo.__file__)),
+                           'main.py')
 
 
 def _write(path, data):
@@ -572,3 +577,57 @@ def test_main_closed_stdin_exit_2(tmp_path, monkeypatch):
 
     assert duplo.main([str(tmp_path), '--no-cache', '--interactive']) == 2
     assert _left(tmp_path) == ['a.jpg', 'b.jpg']
+
+
+# --- platform-specific ------------------------------------------------------
+
+def test_main_output_encoding_without_emoji_support(tmp_path):
+    root = tmp_path / 'tree'
+    _write(root / 'фото😀.jpg', b'X' * 10)
+    _write(root / 'копия😀.jpg', b'X' * 10)
+    env = dict(os.environ, PYTHONIOENCODING='cp1252')
+
+    result = subprocess.run(
+        [sys.executable, MAIN_SCRIPT, str(root), '--no-cache'],
+        env=env, capture_output=True, timeout=60, check=False)
+
+    assert result.returncode == 0, result.stderr.decode('cp1252', 'replace')
+    assert b'\\U0001f600' in result.stdout
+
+
+@WINDOWS_ONLY
+def test_apply_plan_readonly_file_windows_not_deleted(tmp_path):
+    _write(tmp_path / 'a.jpg', b'X' * 10)
+    _write(tmp_path / 'b.jpg', b'X' * 10)
+    _, duplicates = _analyze(tmp_path)
+    plan = duplo.build_plan(duplicates, [str(tmp_path / 'b.jpg')], [])
+    os.chmod(tmp_path / 'b.jpg', stat.S_IREAD)
+    try:
+        assert duplo.apply_plan(plan) == 1
+        assert (tmp_path / 'b.jpg').exists()
+    finally:
+        os.chmod(tmp_path / 'b.jpg', stat.S_IREAD | stat.S_IWRITE)
+
+
+@WINDOWS_ONLY
+def test_build_plan_path_case_insensitive_windows(tmp_path):
+    _write(tmp_path / 'a.jpg', b'X' * 10)
+    _write(tmp_path / 'b.jpg', b'X' * 10)
+    _, duplicates = _analyze(tmp_path)
+
+    plan = duplo.build_plan(duplicates, [str(tmp_path / 'b.jpg').upper()], [])
+
+    assert [os.path.basename(v.path) for v, _ in plan.deletions] == ['b.jpg']
+
+
+@WINDOWS_ONLY
+def test_main_long_path_windows_does_not_crash(tmp_path):
+    deep = tmp_path.joinpath(*(['d' * 50] * 6))
+    try:
+        _write(deep / 'a.jpg', b'X' * 10)
+        _write(deep / 'b.jpg', b'X' * 10)
+    except OSError:
+        pytest.skip('long paths are disabled on this host')
+
+    assert duplo.main([str(tmp_path), '--no-cache']) == 0
+
