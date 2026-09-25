@@ -11,12 +11,15 @@ import pytest
 
 import main as duplo
 
-POSIX_ONLY = pytest.mark.skipif(sys.platform == 'win32',
-                                reason='symlink/FIFO need POSIX')
-WINDOWS_ONLY = pytest.mark.skipif(sys.platform != 'win32',
-                                  reason='Windows filesystem semantics')
-MAIN_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(duplo.__file__)),
-                           'main.py')
+POSIX_ONLY = pytest.mark.skipif(
+    sys.platform == 'win32', reason='symlink/FIFO need POSIX'
+)
+WINDOWS_ONLY = pytest.mark.skipif(
+    sys.platform != 'win32', reason='Windows filesystem semantics'
+)
+MAIN_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(duplo.__file__)), 'main.py'
+)
 
 
 def _write(path, data):
@@ -35,8 +38,11 @@ def _names(group):
 
 
 def _left(root):
-    return sorted(str(p.relative_to(root)).replace(os.sep, '/')
-                  for p in root.rglob('*') if p.is_file())
+    return sorted(
+        str(p.relative_to(root)).replace(os.sep, '/')
+        for p in root.rglob('*')
+        if p.is_file()
+    )
 
 
 def _run(root, *flags, answers=('y',), monkeypatch=None):
@@ -46,6 +52,7 @@ def _run(root, *flags, answers=('y',), monkeypatch=None):
 
 
 # --- scan ------------------------------------------------------------------
+
 
 @POSIX_ONLY
 def test_scan_directory_symlink_skipped(tmp_path):
@@ -67,8 +74,10 @@ def test_scan_directory_fifo_skipped(tmp_path):
     assert files == []
 
 
-@pytest.mark.skipif(hasattr(os, 'geteuid') and os.geteuid() == 0,
-                    reason='root ignores permissions')
+@pytest.mark.skipif(
+    hasattr(os, 'geteuid') and os.geteuid() == 0,
+    reason='root ignores permissions',
+)
 @POSIX_ONLY
 def test_scan_directory_unreadable_dir_reported(tmp_path):
     locked = tmp_path / 'locked'
@@ -83,6 +92,7 @@ def test_scan_directory_unreadable_dir_reported(tmp_path):
 
 
 # --- duplicates -------------------------------------------------------------
+
 
 def test_find_duplicates_same_content_grouped(tmp_path):
     _write(tmp_path / 'a' / 'one.jpg', b'Z' * 10)
@@ -119,8 +129,9 @@ def test_find_duplicates_groups_sorted_by_path(tmp_path):
     _, duplicates = _analyze(tmp_path)
 
     assert _names(next(iter(duplicates.values()))) == ['a.jpg', 'z.jpg']
-    assert [os.path.basename(e.path)
-            for e in next(iter(duplicates.values()))] == ['a.jpg', 'z.jpg']
+    assert [
+        os.path.basename(e.path) for e in next(iter(duplicates.values()))
+    ] == ['a.jpg', 'z.jpg']
 
 
 def _failing_hash_for(name):
@@ -135,8 +146,9 @@ def _failing_hash_for(name):
     return fake
 
 
-def test_find_duplicates_read_error_reported_and_excluded(tmp_path,
-                                                          monkeypatch):
+def test_find_duplicates_read_error_reported_and_excluded(
+    tmp_path, monkeypatch
+):
     for name in ('a.jpg', 'b.jpg', 'locked.jpg'):
         _write(tmp_path / name, b'D' * 32)
     monkeypatch.setattr('main.hash_file', _failing_hash_for('locked.jpg'))
@@ -163,7 +175,8 @@ def test_find_duplicates_read_error_not_cached(tmp_path, monkeypatch):
 
 
 def test_find_identical_directories_dir_with_unreadable_file_excluded(
-        tmp_path, monkeypatch):
+    tmp_path, monkeypatch
+):
     for name in ('A', 'B'):
         _write(tmp_path / name / 'x.jpg', b'X' * 100)
     # Same size as x.jpg, so hashing is attempted and fails.
@@ -176,6 +189,7 @@ def test_find_identical_directories_dir_with_unreadable_file_excluded(
 
 
 # --- identical directories --------------------------------------------------
+
 
 def test_find_identical_directories_dir_with_unique_file_excluded(tmp_path):
     _write(tmp_path / 'A' / 'shared.jpg', b'X' * 100)
@@ -211,6 +225,7 @@ def test_find_identical_directories_leaf_dirs_grouped(tmp_path):
 
 # --- plan -------------------------------------------------------------------
 
+
 def test_parse_keep_indices_empty_answer_raises():
     with pytest.raises(ValueError):
         duplo.parse_keep_indices('', 3)
@@ -242,11 +257,15 @@ def test_select_interactive_uppercase_a_applies_to_rest(tmp_path):
     _, duplicates = _analyze(tmp_path)
     answers = iter(['A'])
 
-    paths, dirs = duplo.select_interactive(duplicates, [],
-                                           lambda _: next(answers))
+    paths, dirs = duplo.select_interactive(
+        duplicates, [], lambda _: next(answers)
+    )
 
     assert sorted(os.path.basename(p) for p in paths) == [
-        'g0_2.jpg', 'g1_2.jpg', 'g2_2.jpg']
+        'g0_2.jpg',
+        'g1_2.jpg',
+        'g2_2.jpg',
+    ]
     assert dirs == []
 
 
@@ -257,8 +276,9 @@ def test_select_interactive_file_auto_does_not_leak_to_dirs(tmp_path):
     identical = duplo.find_identical_directories(duplicates)
     answers = iter(['A', 's'])
 
-    paths, dirs = duplo.select_interactive(duplicates, identical,
-                                           lambda _: next(answers))
+    paths, dirs = duplo.select_interactive(
+        duplicates, identical, lambda _: next(answers)
+    )
 
     assert len(paths) == 1
     assert dirs == []
@@ -277,8 +297,9 @@ def test_build_plan_rejects_deleting_all_copies(tmp_path):
     _, duplicates = _analyze(tmp_path)
 
     with pytest.raises(duplo.PlanError):
-        duplo.build_plan(duplicates, [str(tmp_path / 'A' / 'x.jpg')],
-                         [str(tmp_path / 'B')])
+        duplo.build_plan(
+            duplicates, [str(tmp_path / 'A' / 'x.jpg')], [str(tmp_path / 'B')]
+        )
 
 
 def test_build_plan_rejects_non_duplicate_path(tmp_path):
@@ -292,6 +313,7 @@ def test_build_plan_rejects_non_duplicate_path(tmp_path):
 
 
 # --- apply ------------------------------------------------------------------
+
 
 def test_apply_plan_modified_file_not_deleted(tmp_path):
     _write(tmp_path / 'a.jpg', b'X' * 10)
@@ -432,6 +454,7 @@ def test_apply_plan_dry_run_deletes_nothing(tmp_path):
 
 # --- cache ------------------------------------------------------------------
 
+
 def test_hash_cache_pickle_payload_not_executed(tmp_path):
     marker = tmp_path / 'pwned'
 
@@ -456,8 +479,9 @@ def test_hash_cache_roundtrip_stale_entry_ignored(tmp_path):
     cache.save()
 
     reloaded = duplo.HashCache(cache_file)
-    stale = files[0].__class__(files[0].path, 11, files[0].mtime_ns,
-                               files[0].dev, files[0].ino)
+    stale = files[0].__class__(
+        files[0].path, 11, files[0].mtime_ns, files[0].dev, files[0].ino
+    )
 
     assert reloaded.get(files[0]) == 'deadbeef'
     assert reloaded.get(stale) is None
@@ -512,8 +536,9 @@ def test_hash_cache_old_pickle_file_ignored(tmp_path):
 
 # --- misc -------------------------------------------------------------------
 
+
 def test_format_size_beyond_terabytes_returns_string():
-    assert duplo.format_size(2 ** 60) == '1.00 EB'
+    assert duplo.format_size(2**60) == '1.00 EB'
 
 
 def test_safe_text_escapes_newline_and_ansi():
@@ -526,32 +551,46 @@ def test_get_file_category_uppercase_extension():
 
 # --- end-to-end -------------------------------------------------------------
 
+
 def test_main_missing_directory_exit_2(tmp_path):
     assert duplo.main([str(tmp_path / 'absent')]) == 2
 
 
-def test_main_auto_first_identical_dirs_keeps_unique_files(tmp_path,
-                                                          monkeypatch):
+def test_main_auto_first_identical_dirs_keeps_unique_files(
+    tmp_path, monkeypatch
+):
     _write(tmp_path / 'A' / 'shared.jpg', b'X' * 100)
     _write(tmp_path / 'A' / 'uniqA.jpg', b'a' * 7)
     _write(tmp_path / 'B' / 'shared.jpg', b'X' * 100)
     _write(tmp_path / 'B' / 'uniqB.jpg', b'b' * 9)
     _write(tmp_path / 'B' / 'sub' / 'deep.jpg', b'deep')
 
-    code = _run(tmp_path, '--auto-first', '--find-identical-dirs',
-                monkeypatch=monkeypatch)
+    code = _run(
+        tmp_path,
+        '--auto-first',
+        '--find-identical-dirs',
+        monkeypatch=monkeypatch,
+    )
 
     assert code == 0
-    assert _left(tmp_path) == ['A/shared.jpg', 'A/uniqA.jpg',
-                               'B/sub/deep.jpg', 'B/uniqB.jpg']
+    assert _left(tmp_path) == [
+        'A/shared.jpg',
+        'A/uniqA.jpg',
+        'B/sub/deep.jpg',
+        'B/uniqB.jpg',
+    ]
 
 
 def test_main_auto_first_identical_leaf_dirs_removed(tmp_path, monkeypatch):
     for name in ('A', 'B'):
         _write(tmp_path / name / 'x.jpg', b'X' * 100)
 
-    code = _run(tmp_path, '--auto-first', '--find-identical-dirs',
-                monkeypatch=monkeypatch)
+    code = _run(
+        tmp_path,
+        '--auto-first',
+        '--find-identical-dirs',
+        monkeypatch=monkeypatch,
+    )
 
     assert code == 0
     assert _left(tmp_path) == ['A/x.jpg']
@@ -562,8 +601,13 @@ def test_main_conflicting_choice_deletes_nothing(tmp_path, monkeypatch):
     _write(tmp_path / 'A' / 'x.jpg', b'X' * 100)
     _write(tmp_path / 'B' / 'x.jpg', b'X' * 100)
 
-    code = _run(tmp_path, '--interactive', '--find-identical-dirs',
-                answers=('a', 'b'), monkeypatch=monkeypatch)
+    code = _run(
+        tmp_path,
+        '--interactive',
+        '--find-identical-dirs',
+        answers=('a', 'b'),
+        monkeypatch=monkeypatch,
+    )
 
     assert code == 2
     assert _left(tmp_path) == ['A/x.jpg', 'B/x.jpg']
@@ -584,6 +628,7 @@ def test_main_closed_stdin_exit_2(tmp_path, monkeypatch):
 
 # --- platform-specific ------------------------------------------------------
 
+
 def test_main_output_encoding_without_emoji_support(tmp_path):
     root = tmp_path / 'tree'
     _write(root / 'фото😀.jpg', b'X' * 10)
@@ -592,7 +637,11 @@ def test_main_output_encoding_without_emoji_support(tmp_path):
 
     result = subprocess.run(
         [sys.executable, MAIN_SCRIPT, str(root), '--no-cache'],
-        env=env, capture_output=True, timeout=60, check=False)
+        env=env,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
 
     assert result.returncode == 0, result.stderr.decode('cp1252', 'replace')
     assert b'\\U0001f600' in result.stdout
