@@ -19,8 +19,14 @@ import ast
 import sys
 
 DESTRUCTIVE = {
-    'os.remove', 'os.unlink', 'os.rmdir', 'os.removedirs',
-    'shutil.rmtree', 'shutil.move', 'os.rename', 'os.replace',
+    'os.remove',
+    'os.unlink',
+    'os.rmdir',
+    'os.removedirs',
+    'shutil.rmtree',
+    'shutil.move',
+    'os.rename',
+    'os.replace',
 }
 ALLOWED_DESTRUCTIVE = {
     '_delete_file': {'os.remove'},
@@ -67,7 +73,8 @@ class _Checker(ast.NodeVisitor):
         for alias in node.names:
             if alias.name.split('.')[0] in FORBIDDEN_MODULES:
                 self.errors.append(
-                    f'{node.lineno}: forbidden import {alias.name}')
+                    f'{node.lineno}: forbidden import {alias.name}'
+                )
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         module = (node.module or '').split('.')[0]
@@ -78,7 +85,8 @@ class _Checker(ast.NodeVisitor):
             if names & DESTRUCTIVE:
                 self.errors.append(
                     f'{node.lineno}: import destructive functions via '
-                    f'module attribute only (os.remove, not remove)')
+                    f'module attribute only (os.remove, not remove)'
+                )
 
     def visit_Call(self, node: ast.Call) -> None:
         name = _dotted(node.func)
@@ -86,15 +94,19 @@ class _Checker(ast.NodeVisitor):
         if name in FORBIDDEN_CALLS:
             self.errors.append(f'{node.lineno}: forbidden call {name}()')
         for keyword in node.keywords:
-            if (keyword.arg == 'shell'
-                    and isinstance(keyword.value, ast.Constant)
-                    and keyword.value.value is True):
+            if (
+                keyword.arg == 'shell'
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value is True
+            ):
                 self.errors.append(f'{node.lineno}: shell=True')
         if name in DESTRUCTIVE and name not in ALLOWED_DESTRUCTIVE.get(
-                where, set()):
+            where, set()
+        ):
             self.errors.append(
                 f'{node.lineno}: {name}() in {where}; allowed only in '
-                f'{sorted(ALLOWED_DESTRUCTIVE)}')
+                f'{sorted(ALLOWED_DESTRUCTIVE)}'
+            )
         self.generic_visit(node)
 
 
