@@ -31,6 +31,8 @@ from collections.abc import Callable, Iterable
 
 __version__ = '0.3.1'
 
+# Compact table layout is intentional: one category per line group.
+# fmt: off
 _FILE_CATEGORIES_SPEC = {
     'images': {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp',
                '.raw', '.heic', '.svg', '.ico', '.jpe', '.tif'},
@@ -53,6 +55,7 @@ _FILE_CATEGORIES_SPEC = {
     'fonts': {'.ttf', '.otf', '.woff', '.woff2', '.eot', '.fon'},
     'design': {'.psd', '.ai', '.sketch', '.fig', '.xd', '.indd'},
 }
+# fmt: on
 FILE_CATEGORIES = types.MappingProxyType(
     {cat: frozenset(exts) for cat, exts in _FILE_CATEGORIES_SPEC.items()})
 """Read-only: category -> extensions. Order defines priority."""
