@@ -25,7 +25,8 @@ import stat
 import sys
 import tempfile
 import time
-from typing import Callable, Iterable, Optional
+from collections.abc import Callable, Iterable
+from typing import Optional
 
 __version__ = '0.3.0'
 
@@ -72,7 +73,19 @@ class FileEntry:
     ino: int
 
 
-def _bucket() -> dict:
+Bucket = dict[str, int]
+"""Counters {'count': N, 'size': bytes} for one statistics key."""
+DuplicateGroups = dict[str, list[FileEntry]]
+"""Content digest -> copies sorted by path, 2+ entries each."""
+DirGroups = list[list[str]]
+"""Groups of identical directories, each sorted, 2+ entries each."""
+Selection = tuple[list[str], list[str]]
+"""(paths_to_delete, dirs_to_delete) before validation by build_plan."""
+KeepChoice = tuple[Optional[set[int]], bool]
+"""(kept indices or None to skip the group, apply_to_rest)."""
+
+
+def _bucket() -> Bucket:
     return {'count': 0, 'size': 0}
 
 
@@ -81,15 +94,15 @@ class ScanStats:
     """Aggregated scan statistics and non-fatal errors."""
     total_files: int = 0
     total_size: int = 0
-    by_extension: dict = dataclasses.field(
+    by_extension: collections.defaultdict[str, Bucket] = dataclasses.field(
         default_factory=lambda: collections.defaultdict(_bucket))
-    by_category: dict = dataclasses.field(
+    by_category: collections.defaultdict[str, Bucket] = dataclasses.field(
         default_factory=lambda: collections.defaultdict(_bucket))
-    by_directory: dict = dataclasses.field(
+    by_directory: collections.defaultdict[str, Bucket] = dataclasses.field(
         default_factory=lambda: collections.defaultdict(_bucket))
-    skipped: collections.Counter = dataclasses.field(
+    skipped: collections.Counter[str] = dataclasses.field(
         default_factory=collections.Counter)
-    errors: list = dataclasses.field(default_factory=list)
+    errors: list[str] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -100,8 +113,8 @@ class Plan:
       deletions: Pairs (victim, keeper). The keeper is never deleted.
       dirs: Directories to remove with os.rmdir after their files are gone.
     """
-    deletions: list
-    dirs: list
+    deletions: list[tuple[FileEntry, FileEntry]]
+    dirs: list[str]
 
     @property
     def total_size(self) -> int:
@@ -144,7 +157,7 @@ def _key(path: str) -> str:
     return os.path.normcase(os.path.abspath(path))
 
 
-def scan_directory(directory: str) -> tuple:
+def scan_directory(directory: str) -> tuple[list[FileEntry], ScanStats]:
     """Takes a snapshot of all regular files under a directory.
 
     Symlinks, FIFOs, sockets and devices are skipped and counted. Walk and
@@ -214,7 +227,7 @@ class HashCache:
     with a warning. It never deserializes executable content.
     """
 
-    def __init__(self, cache_file: str):
+    def __init__(self, cache_file: str) -> None:
         self._path = cache_file
         self._data = {}
         try:
@@ -260,7 +273,7 @@ class HashCache:
 
 def find_duplicates(files: Iterable[FileEntry],
                     cache: Optional[HashCache] = None,
-                    errors: Optional[list] = None) -> dict:
+                    errors: Optional[list[str]] = None) -> DuplicateGroups:
     """Groups non-empty regular files with identical content hashes.
 
     Hardlinks to one inode are reported once: deleting one of them frees no
@@ -310,7 +323,8 @@ def find_duplicates(files: Iterable[FileEntry],
             for d, g in groups.items() if len(g) > 1}
 
 
-def _leaf_signature(dir_path: str, hash_by_key: dict) -> Optional[tuple]:
+def _leaf_signature(dir_path: str,
+                    hash_by_key: dict[str, str]) -> Optional[tuple[str, ...]]:
     """Returns sorted hashes of a leaf directory, or None if not eligible.
 
     Eligible: no subdirectories, no non-regular entries, every file is in a
@@ -331,7 +345,7 @@ def _leaf_signature(dir_path: str, hash_by_key: dict) -> Optional[tuple]:
     return tuple(sorted(hashes)) or None
 
 
-def find_identical_directories(duplicates: dict) -> list:
+def find_identical_directories(duplicates: DuplicateGroups) -> DirGroups:
     """Finds leaf directories whose contents are identical.
 
     Args:
@@ -352,7 +366,7 @@ def find_identical_directories(duplicates: dict) -> list:
     return sorted(sorted(g) for g in by_signature.values() if len(g) > 1)
 
 
-def parse_keep_indices(answer: str, count: int) -> set:
+def parse_keep_indices(answer: str, count: int) -> set[int]:
     """Parses 1-based copy numbers to keep ('1 3' or '1,3').
 
     Raises:
@@ -370,7 +384,7 @@ def parse_keep_indices(answer: str, count: int) -> set:
 
 
 def ask_keep(count: int,
-             read: Optional[Callable[[str], str]] = None) -> tuple:
+             read: Optional[Callable[[str], str]] = None) -> KeepChoice:
     """Asks which items of a group to keep until the answer is valid.
 
     Args:
@@ -394,7 +408,8 @@ def ask_keep(count: int,
             return {count - 1}, False
         if answer == 'm':
             try:
-                return parse_keep_indices(read('Номера сохраняемых: '), count), False
+                kept = parse_keep_indices(read('Номера сохраняемых: '), count)
+                return kept, False
             except ValueError as err:
                 print(f'Ошибка: {err}')
                 continue
@@ -405,9 +420,9 @@ _MENU = ('  [s] пропустить  [a] оставить первую  [b] о�
          '  [m] выбрать вручную  [A] оставить первую во всех оставшихся')
 
 
-def select_interactive(duplicates: dict, identical_dirs: list,
+def select_interactive(duplicates: DuplicateGroups, identical_dirs: DirGroups,
                        read: Optional[Callable[[str], str]] = None
-                       ) -> tuple:
+                       ) -> Selection:
     """Interactively selects files and directories to delete.
 
     Returns:
@@ -446,14 +461,15 @@ def select_interactive(duplicates: dict, identical_dirs: list,
     return paths, dirs
 
 
-def select_auto_first(duplicates: dict, identical_dirs: list) -> tuple:
+def select_auto_first(duplicates: DuplicateGroups,
+                      identical_dirs: DirGroups) -> Selection:
     """Keeps the first item (by sorted path) of every group."""
     paths = [e.path for group in duplicates.values() for e in group[1:]]
     dirs = [d for group in identical_dirs for d in group[1:]]
     return paths, dirs
 
 
-def build_plan(duplicates: dict, paths_to_delete: Iterable[str],
+def build_plan(duplicates: DuplicateGroups, paths_to_delete: Iterable[str],
                dirs_to_delete: Iterable[str]) -> Plan:
     """Builds a deletion plan and checks its safety invariants.
 
@@ -560,7 +576,8 @@ def print_section(title: str) -> None:
 def print_summary(stats: ScanStats) -> None:
     """Prints scan totals, categories, top extensions and directories."""
     print_section('СВОДНАЯ СТАТИСТИКА')
-    print(f'Файлов: {stats.total_files}, объём: {format_size(stats.total_size)}')
+    print(f'Файлов: {stats.total_files}, '
+          f'объём: {format_size(stats.total_size)}')
     if stats.skipped:
         print(f'Пропущено необычных объектов (symlink, FIFO и т.п.): '
               f'{stats.skipped["non_regular"]}')
@@ -586,7 +603,7 @@ def print_summary(stats: ScanStats) -> None:
               f'{format_size(data["size"])}')
 
 
-def print_duplicates(duplicates: dict, by_category: bool) -> None:
+def print_duplicates(duplicates: DuplicateGroups, by_category: bool) -> None:
     """Prints duplicate groups, optionally grouped by category."""
     wasted = sum(g[0].size * (len(g) - 1) for g in duplicates.values())
     print_section('ДУБЛИКАТЫ')
@@ -605,7 +622,7 @@ def print_duplicates(duplicates: dict, by_category: bool) -> None:
                 print(f'  -> {safe_text(entry.path)}')
 
 
-def print_identical_dirs(identical_dirs: list) -> None:
+def print_identical_dirs(identical_dirs: DirGroups) -> None:
     print_section('ИДЕНТИЧНЫЕ КАТАЛОГИ (ТОЛЬКО БЕЗ ПОДКАТАЛОГОВ)')
     for i, group in enumerate(identical_dirs, 1):
         print(f'\nГруппа {i}')
@@ -653,7 +670,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[list] = None) -> int:
+def main(argv: Optional[list[str]] = None) -> int:
     """Command-line entry point. Returns the process exit code."""
     args = build_parser().parse_args(argv)
     if not os.path.isdir(args.source_dir):
