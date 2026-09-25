@@ -55,8 +55,12 @@ FILE_CATEGORIES = {
 _CATEGORY_BY_EXT = {ext: cat for cat, exts in FILE_CATEGORIES.items()
                     for ext in exts}
 _SIZE_UNITS = ('B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB')
-_PREVIEW_LIMIT = 20
-_HASH_BLOCK = 1 << 20
+_PREVIEW_LIMIT = 20        # Files listed in the deletion preview and errors.
+_PROGRESS_INTERVAL = 100   # Hashed files between progress updates.
+_TOP_EXTENSIONS = 15       # Rows in the per-extension summary.
+_TOP_DIRECTORIES = 10      # Rows in the per-directory summary.
+_SEPARATOR_WIDTH = 60      # Width of section separator lines.
+_HASH_BLOCK = 1 << 20      # Read size for hashing, 1 MiB.
 
 
 class PlanError(ValueError):
@@ -315,8 +319,9 @@ def find_duplicates(files: Iterable[FileEntry],
             if cache:
                 cache.set(entry, digest)
         groups[digest].append(entry)
-        if done % 100 == 0:
-            rate = done / max(time.monotonic() - start, 1e-9)
+        if done % _PROGRESS_INTERVAL == 0:
+            elapsed = max(time.monotonic() - start, 1e-9)  # Avoid div by 0.
+            rate = done / elapsed
             print(f'Обработано: {done}/{len(candidates)} ({rate:.1f} файл/с)',
                   end='\r', file=sys.stderr)
     return {d: sorted(g, key=lambda e: e.path)
@@ -570,7 +575,8 @@ def apply_plan(plan: Plan, dry_run: bool = False) -> int:
 
 
 def print_section(title: str) -> None:
-    print(f'\n{"=" * 60}\n{title}\n{"=" * 60}')
+    separator = '=' * _SEPARATOR_WIDTH
+    print(f'\n{separator}\n{title}\n{separator}')
 
 
 def print_summary(stats: ScanStats) -> None:
@@ -588,16 +594,19 @@ def print_summary(stats: ScanStats) -> None:
         print(f'{category.upper():<12} {data["count"]:>7} ({share:5.1f}%) '
               f'{format_size(data["size"]):>12}')
 
-    print_section('ПО РАСШИРЕНИЯМ (ТОП-15 ПО ОБЪЁМУ)')
+    print_section(f'ПО РАСШИРЕНИЯМ (ТОП-{_TOP_EXTENSIONS} ПО ОБЪЁМУ)')
     top_ext = sorted(stats.by_extension.items(),
-                     key=lambda item: item[1]['size'], reverse=True)[:15]
+                     key=lambda item: item[1]['size'],
+                     reverse=True)[:_TOP_EXTENSIONS]
     for ext, data in top_ext:
         print(f'{safe_text(ext) or "(нет)":<10} {data["count"]:>7} '
               f'{format_size(data["size"]):>12}')
 
-    print_section('ПО КАТАЛОГАМ (ТОП-10 ПО ОБЪЁМУ, БЕЗ ПОДКАТАЛОГОВ)')
+    print_section(f'ПО КАТАЛОГАМ (ТОП-{_TOP_DIRECTORIES} ПО ОБЪЁМУ, '
+                  f'БЕЗ ПОДКАТАЛОГОВ)')
     top_dirs = sorted(stats.by_directory.items(),
-                      key=lambda item: item[1]['size'], reverse=True)[:10]
+                      key=lambda item: item[1]['size'],
+                      reverse=True)[:_TOP_DIRECTORIES]
     for dir_path, data in top_dirs:
         print(f'{safe_text(dir_path)}: {data["count"]} файлов, '
               f'{format_size(data["size"])}')
