@@ -120,9 +120,13 @@ class Plan:
     Attributes:
       deletions: Pairs (victim, keeper). The keeper is never deleted.
       dirs: Directories to remove with os.rmdir after their files are gone.
+      real_parents: Parent directory -> its realpath when the plan was
+        built. A mismatch at apply time means a path component was
+        replaced (e.g. by a symlink) and the step is refused.
     """
     deletions: list[tuple[FileEntry, FileEntry]]
     dirs: list[str]
+    real_parents: dict[str, str] = dataclasses.field(default_factory=dict)
 
     @property
     def total_size(self) -> int:
@@ -507,7 +511,21 @@ def build_plan(duplicates: DuplicateGroups, paths_to_delete: Iterable[str],
             raise PlanError('план удаляет все копии группы: '
                             + ', '.join(safe_text(e.path) for e in group))
         deletions.extend((victim, survivors[0]) for victim in victims)
-    return Plan(deletions=deletions, dirs=dirs)
+    parents = {os.path.dirname(v.path) for v, _ in deletions}
+    parents |= {os.path.dirname(d) for d in dirs}
+    real_parents = {p: os.path.realpath(p) for p in parents}
+    return Plan(deletions=deletions, dirs=dirs, real_parents=real_parents)
+
+
+def _parent_moved(path: str, plan: Plan) -> bool:
+    """True if the parent of path resolves elsewhere than at plan time.
+
+    Catches a directory on the path being swapped for a symlink between
+    confirmation and deletion. A window between this check and the
+    removal itself remains.
+    """
+    parent = os.path.dirname(path)
+    return os.path.realpath(parent) != plan.real_parents.get(parent)
 
 
 def verify_before_delete(victim: FileEntry,
@@ -548,7 +566,10 @@ def apply_plan(plan: Plan, dry_run: bool = False) -> int:
     for victim, keeper in plan.deletions:
         shown = safe_text(victim.path)
         try:
-            reason = verify_before_delete(victim, keeper)
+            if _parent_moved(victim.path, plan):
+                reason = 'каталог изменился после построения плана'
+            else:
+                reason = verify_before_delete(victim, keeper)
             if reason:
                 print(f'[SKIP] {shown}: {reason}', file=sys.stderr)
                 failures += 1
@@ -569,6 +590,11 @@ def apply_plan(plan: Plan, dry_run: bool = False) -> int:
             print(f'[DRY-RUN] удалить пустой каталог {shown}')
             continue
         try:
+            if _parent_moved(dir_path, plan) or os.path.islink(dir_path):
+                print(f'[SKIP] каталог {shown}: путь изменился после '
+                      f'построения плана', file=sys.stderr)
+                failures += 1
+                continue
             os.rmdir(dir_path)
             print(f'Удалён каталог {shown}')
         except OSError as err:
