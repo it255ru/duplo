@@ -576,6 +576,25 @@ def _delete_file(victim: FileEntry, keeper: FileEntry, plan: Plan,
         return False
 
 
+def _predict_rmdir(dir_path: str, plan: Plan) -> bool:
+    """Dry-run check: would the directory be empty after planned deletions?
+
+    Raises:
+      OSError: The directory cannot be listed.
+    """
+    shown = safe_text(dir_path)
+    planned = {os.path.normcase(os.path.basename(v.path))
+               for v, _ in plan.deletions
+               if _key(os.path.dirname(v.path)) == _key(dir_path)}
+    extra = {os.path.normcase(n) for n in os.listdir(dir_path)} - planned
+    if extra:
+        print(f'[DRY-RUN] каталог {shown} не будет удалён: '
+              f'{len(extra)} объектов вне плана', file=sys.stderr)
+        return False
+    print(f'[DRY-RUN] удалить пустой каталог {shown}')
+    return True
+
+
 def _remove_dir(dir_path: str, plan: Plan, dry_run: bool) -> bool:
     """Removes one planned directory if it is empty. Returns True on success.
 
@@ -583,10 +602,9 @@ def _remove_dir(dir_path: str, plan: Plan, dry_run: bool) -> bool:
     plan keeps the directory in place.
     """
     shown = safe_text(dir_path)
-    if dry_run:
-        print(f'[DRY-RUN] удалить пустой каталог {shown}')
-        return True
     try:
+        if dry_run:
+            return _predict_rmdir(dir_path, plan)
         if _parent_moved(dir_path, plan) or os.path.islink(dir_path):
             print(f'[SKIP] каталог {shown}: путь изменился после '
                   f'построения плана', file=sys.stderr)
