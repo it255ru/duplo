@@ -117,6 +117,58 @@ def test_find_duplicates_groups_sorted_by_path(tmp_path):
             for e in next(iter(duplicates.values()))] == ['a.jpg', 'z.jpg']
 
 
+def _failing_hash_for(name):
+    """Returns a hash_file replacement that fails for one file name."""
+    real = duplo.hash_file
+
+    def fake(path):
+        if os.path.basename(path) == name:
+            raise PermissionError(13, 'Permission denied', path)
+        return real(path)
+
+    return fake
+
+
+def test_find_duplicates_read_error_reported_and_excluded(tmp_path,
+                                                          monkeypatch):
+    for name in ('a.jpg', 'b.jpg', 'locked.jpg'):
+        _write(tmp_path / name, b'D' * 32)
+    monkeypatch.setattr('main.hash_file', _failing_hash_for('locked.jpg'))
+    files, stats = duplo.scan_directory(str(tmp_path))
+
+    duplicates = duplo.find_duplicates(files, None, stats.errors)
+
+    assert [_names(g) for g in duplicates.values()] == [['a.jpg', 'b.jpg']]
+    assert len(stats.errors) == 1
+    assert 'locked.jpg' in stats.errors[0]
+
+
+def test_find_duplicates_read_error_not_cached(tmp_path, monkeypatch):
+    for name in ('a.jpg', 'locked.jpg'):
+        _write(tmp_path / name, b'D' * 32)
+    monkeypatch.setattr('main.hash_file', _failing_hash_for('locked.jpg'))
+    files, _ = duplo.scan_directory(str(tmp_path))
+    cache = duplo.HashCache(str(tmp_path / 'cache.json'))
+
+    duplo.find_duplicates(files, cache, [])
+
+    locked = next(f for f in files if f.path.endswith('locked.jpg'))
+    assert cache.get(locked) is None
+
+
+def test_find_identical_directories_dir_with_unreadable_file_excluded(
+        tmp_path, monkeypatch):
+    for name in ('A', 'B'):
+        _write(tmp_path / name / 'x.jpg', b'X' * 100)
+    # Same size as x.jpg, so hashing is attempted and fails.
+    _write(tmp_path / 'B' / 'locked.jpg', b'X' * 100)
+    monkeypatch.setattr('main.hash_file', _failing_hash_for('locked.jpg'))
+    files, stats = duplo.scan_directory(str(tmp_path))
+    duplicates = duplo.find_duplicates(files, None, stats.errors)
+
+    assert duplo.find_identical_directories(duplicates) == []
+
+
 # --- identical directories --------------------------------------------------
 
 def test_find_identical_directories_dir_with_unique_file_excluded(tmp_path):
@@ -347,3 +399,12 @@ def test_main_closed_stdin_exit_2(tmp_path, monkeypatch):
 
     assert duplo.main([str(tmp_path), '--no-cache', '--interactive']) == 2
     assert _left(tmp_path) == ['a.jpg', 'b.jpg']
+
+
+# --- anti-example (do not copy) --------------------------------------------
+#
+# def test_dedup():
+#     os.system('python main.py /home/anton/photos --auto-first')
+#     assert True
+#
+# Real data, no assertion on the outcome, exit code ignored.
