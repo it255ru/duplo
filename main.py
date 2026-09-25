@@ -1,595 +1,728 @@
-import os
-import argparse
-import hashlib
-import time
-import pickle
-import shutil
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+"""duplo: finds duplicate files and directories and removes extra copies.
 
-# Словарь для классификации файлов по расширениям
+Works as plan / apply: a filesystem snapshot is taken once, a deletion plan
+is built from it and validated (every duplicate group keeps at least one
+copy), and every step is re-verified against the filesystem right before
+deletion. Anything unexpected makes the step fail instead of deleting.
+
+Exit codes:
+  0: success (including "nothing to do" and a cancelled deletion).
+  1: at least one deletion step failed.
+  2: invalid input: missing directory, invalid plan, closed stdin.
+  130: interrupted by the user.
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import dataclasses
+import filecmp
+import hashlib
+import json
+import os
+import stat
+import sys
+import tempfile
+import time
+from typing import Callable, Iterable, Optional
+
+__version__ = '0.3.0'
+
 FILE_CATEGORIES = {
-    'images': {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp', '.raw', '.heic', '.svg', '.ico', '.jpe', '.tif'},
-    'videos': {'.mp4', '.avi', '.mov', '.wmv', '.flv', '.mkv', '.webm', '.m4v', '.mpg', '.mpeg', '.3gp', '.3gpp', '.m2ts', '.mts', '.ts', '.vob'},
-    'audio': {'.mp3', '.wav', '.flac', '.aac', '.ogg', '.wma', '.m4a', '.amr', '.mka', '.opus'},
-    'documents': {'.pdf', '.doc', '.docx', '.txt', '.rtf', '.xls', '.xlsx', '.ppt', '.pptx', '.odt', '.ods', '.odp', '.md', '.tex'},
-    'archives': {'.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz', '.tgz', '.tbz2'},
-    'executables': {'.exe', '.msi', '.bat', '.cmd', '.sh', '.bin', '.app', '.apk', '.deb', '.rpm'},
-    'scripts': {'.py', '.js', '.java', '.c', '.cpp', '.html', '.css', '.php', '.rb', '.pl', '.sh', '.bash', '.ps1', '.vbs'},
-    'data': {'.db', '.csv', '.json', '.xml', '.sql', '.sqlite', '.sqlite3', '.mdb', '.accdb', '.ini', '.cfg'},
+    'images': {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp',
+               '.raw', '.heic', '.svg', '.ico', '.jpe', '.tif'},
+    'videos': {'.mp4', '.avi', '.mov', '.wmv', '.flv', '.mkv', '.webm',
+               '.m4v', '.mpg', '.mpeg', '.3gp', '.3gpp', '.m2ts', '.mts',
+               '.ts', '.vob'},
+    'audio': {'.mp3', '.wav', '.flac', '.aac', '.ogg', '.wma', '.m4a',
+              '.amr', '.mka', '.opus'},
+    'documents': {'.pdf', '.doc', '.docx', '.txt', '.rtf', '.xls', '.xlsx',
+                  '.ppt', '.pptx', '.odt', '.ods', '.odp', '.md', '.tex'},
+    'archives': {'.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz',
+                 '.tgz', '.tbz2'},
+    'executables': {'.exe', '.msi', '.bat', '.cmd', '.bin', '.app', '.apk',
+                    '.deb', '.rpm'},
+    'scripts': {'.py', '.js', '.java', '.c', '.cpp', '.html', '.css', '.php',
+                '.rb', '.pl', '.sh', '.bash', '.ps1', '.vbs'},
+    'data': {'.db', '.csv', '.json', '.xml', '.sql', '.sqlite', '.sqlite3',
+             '.mdb', '.accdb', '.ini', '.cfg'},
     'system': {'.dll', '.sys', '.inf', '.cat', '.drv', '.ocx', '.cpl'},
     'fonts': {'.ttf', '.otf', '.woff', '.woff2', '.eot', '.fon'},
     'design': {'.psd', '.ai', '.sketch', '.fig', '.xd', '.indd'},
-    'other': set()
 }
+_CATEGORY_BY_EXT = {ext: cat for cat, exts in FILE_CATEGORIES.items()
+                    for ext in exts}
+_SIZE_UNITS = ('B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB')
+_PREVIEW_LIMIT = 20
+_HASH_BLOCK = 1 << 20
 
-def get_file_category(extension):
-    """Определяет категорию файла по его расширению."""
-    for category, extensions in FILE_CATEGORIES.items():
-        if extension.lower() in extensions:
-            return category
-    return 'other'
 
-def get_file_hash(filepath, block_size=65536):
-    """Вычисляет MD5 хеш файла блоками для экономии памяти."""
-    hash_func = hashlib.md5()
-    try:
-        with open(filepath, 'rb') as f:
-            for block in iter(lambda: f.read(block_size), b''):
-                hash_func.update(block)
-        return hash_func.hexdigest()
-    except (IOError, OSError):
-        return None
+class PlanError(ValueError):
+    """Raised when a deletion plan would violate a safety invariant."""
 
-def format_size(size_bytes):
-    """Конвертирует размер в байтах в человеко-читаемый формат."""
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if size_bytes < 1024.0:
-            return f"{size_bytes:.2f} {unit}"
-        size_bytes /= 1024.0
 
-def scan_directory(directory):
-    """Рекурсивно сканирует директорию и собирает статистику."""
-    all_files = []
-    stats = {
-        'total_files': 0,
-        'total_size': 0,
-        'by_extension': defaultdict(lambda: {'count': 0, 'size': 0}),
-        'by_directory': defaultdict(lambda: {'count': 0, 'size': 0}),
-        'by_category': defaultdict(lambda: {'count': 0, 'size': 0})
-    }
+@dataclasses.dataclass(frozen=True)
+class FileEntry:
+    """Snapshot of one regular file taken during the scan."""
+    path: str
+    size: int
+    mtime_ns: int
+    dev: int
+    ino: int
 
-    for root, dirs, files in os.walk(directory):
-        for file in files:
-            full_path = os.path.join(root, file)
+
+def _bucket() -> dict:
+    return {'count': 0, 'size': 0}
+
+
+@dataclasses.dataclass
+class ScanStats:
+    """Aggregated scan statistics and non-fatal errors."""
+    total_files: int = 0
+    total_size: int = 0
+    by_extension: dict = dataclasses.field(
+        default_factory=lambda: collections.defaultdict(_bucket))
+    by_category: dict = dataclasses.field(
+        default_factory=lambda: collections.defaultdict(_bucket))
+    by_directory: dict = dataclasses.field(
+        default_factory=lambda: collections.defaultdict(_bucket))
+    skipped: collections.Counter = dataclasses.field(
+        default_factory=collections.Counter)
+    errors: list = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass
+class Plan:
+    """Validated deletion plan.
+
+    Attributes:
+      deletions: Pairs (victim, keeper). The keeper is never deleted.
+      dirs: Directories to remove with os.rmdir after their files are gone.
+    """
+    deletions: list
+    dirs: list
+
+    @property
+    def total_size(self) -> int:
+        return sum(victim.size for victim, _ in self.deletions)
+
+    def is_empty(self) -> bool:
+        return not self.deletions and not self.dirs
+
+
+def get_file_category(extension: str) -> str:
+    """Maps a file extension to a category.
+
+    Args:
+      extension: Extension with a leading dot in any case, or ''.
+
+    Returns:
+      Category name from FILE_CATEGORIES, or 'other'.
+    """
+    return _CATEGORY_BY_EXT.get(extension.lower(), 'other')
+
+
+def format_size(size_bytes: float) -> str:
+    """Formats a byte count, e.g. 1536 -> '1.50 KB'."""
+    size = float(size_bytes)
+    for unit in _SIZE_UNITS[:-1]:
+        if size < 1024.0:
+            return f'{size:.2f} {unit}'
+        size /= 1024.0
+    return f'{size:.2f} {_SIZE_UNITS[-1]}'
+
+
+def safe_text(text: str) -> str:
+    """Escapes non-printable characters so a file name cannot fake output."""
+    return ''.join(ch if ch.isprintable() else f'\\u{ord(ch):04x}'
+                   for ch in text)
+
+
+def _key(path: str) -> str:
+    """Normalized path used for all identity comparisons."""
+    return os.path.normcase(os.path.abspath(path))
+
+
+def scan_directory(directory: str) -> tuple:
+    """Takes a snapshot of all regular files under a directory.
+
+    Symlinks, FIFOs, sockets and devices are skipped and counted. Walk and
+    stat errors are recorded in stats.errors instead of being ignored.
+
+    Args:
+      directory: Root directory.
+
+    Returns:
+      Tuple (files, stats): list of FileEntry and ScanStats.
+    """
+    stats = ScanStats()
+    files = []
+
+    def on_error(err: OSError) -> None:
+        stats.errors.append(f'{err.filename}: {err.strerror}')
+
+    for root, _, names in os.walk(os.path.abspath(directory),
+                                  onerror=on_error):
+        for name in names:
+            path = os.path.join(root, name)
             try:
-                file_size = os.path.getsize(full_path)
-                mtime = os.path.getmtime(full_path)
-            except OSError:
+                st = os.lstat(path)
+            except OSError as err:
+                on_error(err)
                 continue
+            if not stat.S_ISREG(st.st_mode):
+                stats.skipped['non_regular'] += 1
+                continue
+            entry = FileEntry(path, st.st_size, st.st_mtime_ns, st.st_dev,
+                              st.st_ino)
+            files.append(entry)
+            ext = os.path.splitext(name)[1].lower()
+            stats.total_files += 1
+            stats.total_size += entry.size
+            for bucket in (stats.by_extension[ext],
+                           stats.by_category[get_file_category(ext)],
+                           stats.by_directory[root]):
+                bucket['count'] += 1
+                bucket['size'] += entry.size
+    return files, stats
 
-            stats['total_files'] += 1
-            stats['total_size'] += file_size
 
-            ext = os.path.splitext(file)[1].lower()
-            stats['by_extension'][ext]['count'] += 1
-            stats['by_extension'][ext]['size'] += file_size
-            
-            # Классификация файлов по категориям
-            category = get_file_category(ext)
-            stats['by_category'][category]['count'] += 1
-            stats['by_category'][category]['size'] += file_size
+def hash_file(path: str) -> str:
+    """Returns a BLAKE2b hex digest of a file. Raises OSError on read errors."""
+    digest = hashlib.blake2b(usedforsecurity=False)
+    with open(path, 'rb') as f:
+        for block in iter(lambda: f.read(_HASH_BLOCK), b''):
+            digest.update(block)
+    return digest.hexdigest()
 
-            stats['by_directory'][root]['count'] += 1
-            stats['by_directory'][root]['size'] += file_size
 
-            all_files.append((full_path, file_size, mtime))
+def default_cache_path() -> str:
+    """Returns the per-user cache location (never the current directory)."""
+    if os.name == 'nt':
+        base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+    else:
+        base = (os.environ.get('XDG_CACHE_HOME')
+                or os.path.join(os.path.expanduser('~'), '.cache'))
+    return os.path.join(base, 'duplo', 'hash_cache.json')
 
-    return all_files, stats
 
 class HashCache:
-    """Класс для кэширования вычисленных хешей."""
-    def __init__(self, cache_file="hash_cache.pkl"):
-        self.cache_file = cache_file
-        self.cache = self.load_cache()
-        
-    def load_cache(self):
-        """Загружает кэш из файла."""
-        if os.path.exists(self.cache_file):
-            try:
-                with open(self.cache_file, 'rb') as f:
-                    return pickle.load(f)
-            except:
-                return {}
-        return {}
-    
-    def save_cache(self):
-        """Сохраняет кэш в файл."""
-        with open(self.cache_file, 'wb') as f:
-            pickle.dump(self.cache, f)
-    
-    def get(self, file_path, file_size, mtime):
-        """Получает хеш из кэша, если он актуален."""
-        if file_path in self.cache:
-            cached_data = self.cache[file_path]
-            if (cached_data['size'] == file_size and 
-                cached_data['mtime'] == mtime):
-                return cached_data['hash']
+    """JSON cache of file hashes keyed by path, size, mtime_ns and inode.
+
+    The cache is an optimization only: any load error yields an empty cache
+    with a warning. It never deserializes executable content.
+    """
+
+    def __init__(self, cache_file: str):
+        self._path = cache_file
+        self._data = {}
+        try:
+            with open(cache_file, encoding='utf-8') as f:
+                loaded = json.load(f)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as err:
+            print(f'[WARN] Кэш проигнорирован ({safe_text(cache_file)}): {err}',
+                  file=sys.stderr)
+            return
+        if isinstance(loaded, dict):
+            self._data = loaded
+
+    def get(self, entry: FileEntry) -> Optional[str]:
+        record = self._data.get(_key(entry.path))
+        if (isinstance(record, dict)
+            and record.get('key') == [entry.size, entry.mtime_ns, entry.ino]):
+            digest = record.get('hash')
+            return digest if isinstance(digest, str) else None
         return None
-    
-    def set(self, file_path, file_size, mtime, file_hash):
-        """Сохраняет хеш в кэш."""
-        self.cache[file_path] = {
-            'size': file_size,
-            'mtime': mtime,
-            'hash': file_hash
-        }
 
-def find_duplicates_parallel(file_list, max_workers=8, cache_file=None):
-    """Находит дубликаты используя многопоточность и кэширование."""
-    print("\n[+] Группировка файлов по размеру...")
-    
-    # Инициализируем кэш
-    cache = HashCache(cache_file) if cache_file else None
-    
-    # Группируем файлы по размеру (файлы разного размера не могут быть дубликатами)
-    size_groups = defaultdict(list)
-    for file_path, file_size, mtime in file_list:
-        size_groups[file_size].append((file_path, mtime))
-    
-    # Оставляем только группы с потенциальными дубликатами (2+ файла одинакового размера)
-    candidate_groups = {size: paths for size, paths in size_groups.items() if len(paths) > 1}
-    total_candidates = sum(len(paths) for paths in candidate_groups.values())
-    
-    print(f"[+] Найдено {len(candidate_groups)} групп кандидатов в дубликаты ({total_candidates} файлов)")
-    print("[+] Вычисление хешей для поиска дубликатов...")
-    
-    hashes_map = defaultdict(list)
-    processed = 0
-    from_cache = 0
-    start_time = time.time()
-    
-    # Обрабатываем каждую группу кандидатов
-    for size, file_list in candidate_groups.items():
-        for file_path, mtime in file_list:
-            file_size = size
-            file_hash = None
-            
-            # Пытаемся получить хеш из кэша
-            if cache:
-                file_hash = cache.get(file_path, file_size, mtime)
-                if file_hash:
-                    from_cache += 1
-                    hashes_map[file_hash].append(file_path)
-                    processed += 1
-                    continue
-            
-            # Если нет в кэше, вычисляем
-            if file_hash is None:
-                file_hash = get_file_hash(file_path)
-                if file_hash is not None:
-                    # Сохраняем в кэш
-                    if cache:
-                        cache.set(file_path, file_size, mtime, file_hash)
-                    hashes_map[file_hash].append(file_path)
-            
-            processed += 1
-            if processed % 100 == 0:  # Выводим прогресс каждые 100 файлов
-                elapsed = time.time() - start_time
-                files_per_sec = processed / elapsed if elapsed > 0 else 0
-                print(f"Обработано: {processed}/{total_candidates} файлов ({files_per_sec:.1f} файл/сек)", end="\r")
-    
-    # Сохраняем кэш
-    if cache:
-        cache.save_cache()
-        print(f"\n[+] Использовано хешей из кэша: {from_cache}")
-    
-    print(f"\n[+] Обработка завершена за {time.time() - start_time:.1f} секунд")
-    
-    # Оставляем только настоящие дубликаты (2+ файла с одинаковым хешем)
-    duplicates = {h: paths for h, paths in hashes_map.items() if len(paths) > 1}
-    return duplicates
+    def set(self, entry: FileEntry, digest: str) -> None:
+        self._data[_key(entry.path)] = {
+            'key': [entry.size, entry.mtime_ns, entry.ino], 'hash': digest}
 
-def find_identical_directories(statistics, duplicates):
-    """
-    Находит каталоги, которые содержат одинаковые наборы файлов (дубликаты) в том же количестве.
-    
+    def save(self) -> None:
+        """Writes the cache atomically with mode 0600. Raises OSError."""
+        directory = os.path.dirname(os.path.abspath(self._path))
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix='.hash_cache.')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(self._data, f)
+            os.replace(tmp, self._path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+
+def find_duplicates(files: Iterable[FileEntry],
+                    cache: Optional[HashCache] = None,
+                    errors: Optional[list] = None) -> dict:
+    """Groups non-empty regular files with identical content hashes.
+
+    Hardlinks to one inode are reported once: deleting one of them frees no
+    space. When st_ino is 0 (no stable file ID) no collapsing happens.
+
     Args:
-        statistics: Статистика, собранная функцией scan_directory
-        duplicates: Словарь с найденными дубликатами файлов
-        
+      files: Output of scan_directory.
+      cache: Optional HashCache.
+      errors: Optional list that receives read errors.
+
     Returns:
-        Список групп идентичных каталогов
+      Dict digest -> list of FileEntry sorted by path, 2+ entries each.
     """
-    print("\n[+] Поиск идентичных каталогов...")
-    
-    # Создаем обратный индекс: для каждого каталога определяем его "подпись"
-    # Подпись каталога - это отсортированный список хешей файлов в нем
-    dir_signatures = {}
-    
-    # Сначала создаем словарь для хранения хешей файлов в каждом каталоге
-    dir_hashes = defaultdict(list)
-    
-    # Заполняем dir_hashes на основе информации о дубликатах
-    for file_hash, file_paths in duplicates.items():
-        for file_path in file_paths:
-            dir_path = os.path.dirname(file_path)
-            dir_hashes[dir_path].append(file_hash)
-    
-    # Создаем подписи для каждого каталога
-    for dir_path, hashes in dir_hashes.items():
-        # Сортируем хеши для создания уникальной подписи каталога
-        dir_signatures[dir_path] = tuple(sorted(hashes))
-    
-    # Группируем каталоги по их подписям
-    signature_groups = defaultdict(list)
-    for dir_path, signature in dir_signatures.items():
-        signature_groups[signature].append(dir_path)
-    
-    # Оставляем только группы с более чем одним каталогом
-    identical_dirs = [dirs for dirs in signature_groups.values() if len(dirs) > 1]
-    
-    return identical_dirs
-
-def print_section(title):
-    """Печатает заголовок секции с разделителями."""
-    print("\n" + "="*60)
-    print(title)
-    print("="*60)
-
-def print_duplicates_by_category(duplicates):
-    """Группирует и выводит дубликаты по категориям."""
-    if not duplicates:
-        return
-    
-    # Группируем дубликаты по категориям
-    duplicates_by_category = defaultdict(list)
-    for file_hash, file_paths in duplicates.items():
-        # Определяем категорию первого файла в группе (все файлы в группе одинаковые)
-        first_file = file_paths[0]
-        ext = os.path.splitext(first_file)[1].lower()
-        category = get_file_category(ext)
-        duplicates_by_category[category].append((file_hash, file_paths))
-    
-    # Выводим дубликаты по категориям
-    for category, dup_list in duplicates_by_category.items():
-        print_section(f"ДУБЛИКАТЫ В КАТЕГОРИИ: {category.upper()}")
-        
-        total_size = 0
-        for i, (file_hash, file_paths) in enumerate(dup_list, 1):
-            size = os.path.getsize(file_paths[0])
-            total_size += size * (len(file_paths) - 1)
-
-            print(f"\nГруппа {i} (Хеш: {file_hash[:8]}...), Размер: {format_size(size)}")
-            for path in file_paths:
-                print(f"  -> {path}")
-        
-        print(f"\nОбщий объем дубликатов в категории {category}: {format_size(total_size)}")
-
-def interactive_selection(duplicates, identical_dirs, statistics, auto_select_first=False):
-    """
-    Интерактивный режим для выбора файлов и каталогов для удаления.
-    Если auto_select_first=True, автоматически выбирает "оставить первую копию" для всех групп.
-    """
-    files_to_delete = []
-    dirs_to_delete = []
-    
-    print("\n" + "="*60)
-    print("ИНТЕРАКТИВНЫЙ РЕЖИМ УПРАВЛЕНИЯ ДУБЛИКАТАМИ")
-    print("="*60)
-    
-    # Обработка дубликатов файлов
-    if duplicates:
-        print("\n[+] ОБРАБОТКА ДУБЛИКАТОВ ФАЙЛОВ")
-        for i, (file_hash, file_paths) in enumerate(duplicates.items(), 1):
-            size = os.path.getsize(file_paths[0])
-            ext = os.path.splitext(file_paths[0])[1].lower()
-            category = get_file_category(ext)
-            
-            print(f"\nГруппа {i} (Хеш: {file_hash[:8]}...), Размер: {format_size(size)}, Категория: {category}")
-            
-            for j, path in enumerate(file_paths, 1):
-                print(f"  [{j}] {path}")
-            
-            if auto_select_first:
-                # Автоматически выбираем "оставить первую копию"
-                files_to_delete.extend(file_paths[1:])
-                print("  Автоматически выбрано: удалить все копии, кроме первой")
+    by_size = collections.defaultdict(list)
+    seen_inodes = set()
+    for entry in files:
+        if entry.size == 0:
+            continue
+        if entry.ino:
+            inode = (entry.dev, entry.ino)
+            if inode in seen_inodes:
                 continue
-            
-            print("  [s] Пропустить эту группу")
-            print("  [a] Удалить все копии, кроме первой")
-            print("  [b] Удалить все копии, кроме последней")
-            print("  [m] Выбрать вручную")
-            print("  [A] Применить 'удалить все копии, кроме первой' для всех оставшихся групп")
-            
-            choice = input("\nВаш выбор: ").strip().lower()
-            
-            if choice == 's':
+            seen_inodes.add(inode)
+        by_size[entry.size].append(entry)
+
+    candidates = [e for group in by_size.values() if len(group) > 1
+                  for e in group]
+    groups = collections.defaultdict(list)
+    start = time.monotonic()
+    for done, entry in enumerate(candidates, 1):
+        digest = cache.get(entry) if cache else None
+        if digest is None:
+            try:
+                digest = hash_file(entry.path)
+            except OSError as err:
+                if errors is not None:
+                    errors.append(f'{err.filename}: {err.strerror}')
                 continue
-            elif choice == 'a':
-                # Оставляем первую копию, остальные удаляем
-                files_to_delete.extend(file_paths[1:])
-                print(f"Добавлено для удаления: {len(file_paths) - 1} файлов")
-            elif choice == 'b':
-                # Оставляем последнюю копию, остальные удаляем
-                files_to_delete.extend(file_paths[:-1])
-                print(f"Добавлено для удаления: {len(file_paths) - 1} файлов")
-            elif choice == 'm':
-                # Ручной выбор
-                keep = input("Введите номера файлов, которые нужно сохранить (через пробел): ").split()
-                keep_indices = [int(idx) - 1 for idx in keep if idx.isdigit()]
-                
-                for idx, path in enumerate(file_paths):
-                    if idx not in keep_indices:
-                        files_to_delete.append(path)
-                print(f"Добавлено для удаления: {len(file_paths) - len(keep_indices)} файлов")
-            elif choice == 'a':
-                # Применить правило для всех оставшихся групп
-                files_to_delete.extend(file_paths[1:])
-                print(f"Добавлено для удаления: {len(file_paths) - 1} файлов")
-                print("Применяется правило 'удалить все копии, кроме первой' для всех оставшихся групп")
-                auto_select_first = True
-            else:
-                print("Неверный выбор, пропускаем группу")
-    
-    # Обработка идентичных каталогов
-    if identical_dirs:
-        print("\n[+] ОБРАБОТКА ИДЕНТИЧНЫХ КАТАЛОГОВ")
-        for i, dir_group in enumerate(identical_dirs, 1):
-            print(f"\nГруппа идентичных каталогов #{i}:")
-            for j, dir_path in enumerate(dir_group, 1):
-                dir_stats = statistics['by_directory'][dir_path]
-                print(f"  [{j}] {dir_path} ({dir_stats['count']} файлов, {format_size(dir_stats['size'])})")
-            
-            print("  [s] Пропустить эту группу")
-            print("  [a] Удалить все каталоги, кроме первого")
-            print("  [b] Удалить все каталоги, кроме последнего")
-            print("  [m] Выбрать вручную")
-            
-            choice = input("\nВаш выбор: ").strip().lower()
-            
-            if choice == 's':
+            if cache:
+                cache.set(entry, digest)
+        groups[digest].append(entry)
+        if done % 100 == 0:
+            rate = done / max(time.monotonic() - start, 1e-9)
+            print(f'Обработано: {done}/{len(candidates)} ({rate:.1f} файл/с)',
+                  end='\r', file=sys.stderr)
+    return {d: sorted(g, key=lambda e: e.path)
+            for d, g in groups.items() if len(g) > 1}
+
+
+def _leaf_signature(dir_path: str, hash_by_key: dict) -> Optional[tuple]:
+    """Returns sorted hashes of a leaf directory, or None if not eligible.
+
+    Eligible: no subdirectories, no non-regular entries, every file is in a
+    duplicate group.
+    """
+    hashes = []
+    try:
+        with os.scandir(dir_path) as it:
+            for entry in it:
+                if not entry.is_file(follow_symlinks=False):
+                    return None
+                digest = hash_by_key.get(_key(entry.path))
+                if digest is None:
+                    return None
+                hashes.append(digest)
+    except OSError:
+        return None
+    return tuple(sorted(hashes)) or None
+
+
+def find_identical_directories(duplicates: dict) -> list:
+    """Finds leaf directories whose contents are identical.
+
+    Args:
+      duplicates: Output of find_duplicates.
+
+    Returns:
+      Sorted list of groups; each group is a sorted list of 2+ directories.
+    """
+    hash_by_key = {_key(e.path): d for d, group in duplicates.items()
+                   for e in group}
+    candidate_dirs = {os.path.dirname(e.path) for group in duplicates.values()
+                      for e in group}
+    by_signature = collections.defaultdict(list)
+    for dir_path in candidate_dirs:
+        signature = _leaf_signature(dir_path, hash_by_key)
+        if signature:
+            by_signature[signature].append(dir_path)
+    return sorted(sorted(g) for g in by_signature.values() if len(g) > 1)
+
+
+def parse_keep_indices(answer: str, count: int) -> set:
+    """Parses 1-based copy numbers to keep ('1 3' or '1,3').
+
+    Raises:
+      ValueError: Empty answer, non-numeric token or number out of range.
+    """
+    tokens = answer.replace(',', ' ').split()
+    if not tokens:
+        raise ValueError('не выбрано ни одной копии для сохранения')
+    indices = set()
+    for token in tokens:
+        if not token.isdigit() or not 1 <= int(token) <= count:
+            raise ValueError(f'неверный номер: {token!r}, допустимо 1..{count}')
+        indices.add(int(token) - 1)
+    return indices
+
+
+def ask_keep(count: int,
+             read: Optional[Callable[[str], str]] = None) -> tuple:
+    """Asks which items of a group to keep until the answer is valid.
+
+    Args:
+      count: Number of items in the group.
+      read: Input function; defaults to builtins.input resolved at call
+        time.
+
+    Returns:
+      Tuple (kept_indices or None to skip the group, apply_to_rest).
+    """
+    read = read or input
+    while True:
+        answer = read('Ваш выбор: ').strip()
+        if answer == 's':
+            return None, False
+        if answer == 'a':
+            return {0}, False
+        if answer == 'A':
+            return {0}, True
+        if answer == 'b':
+            return {count - 1}, False
+        if answer == 'm':
+            try:
+                return parse_keep_indices(read('Номера сохраняемых: '), count), False
+            except ValueError as err:
+                print(f'Ошибка: {err}')
                 continue
-            elif choice == 'a':
-                # Оставляем первый каталог, остальные удаляем
-                dirs_to_delete.extend(dir_group[1:])
-                print(f"Добавлено для удаления: {len(dir_group) - 1} каталогов")
-            elif choice == 'b':
-                # Оставляем последний каталог, остальные удаляем
-                dirs_to_delete.extend(dir_group[:-1])
-                print(f"Добавлено для удаления: {len(dir_group) - 1} каталогов")
-            elif choice == 'm':
-                # Ручной выбор
-                keep = input("Введите номера каталогов, которые нужно сохранить (через пробел): ").split()
-                keep_indices = [int(idx) - 1 for idx in keep if idx.isdigit()]
-                
-                for idx, dir_path in enumerate(dir_group):
-                    if idx not in keep_indices:
-                        dirs_to_delete.append(dir_path)
-                print(f"Добавлено для удаления: {len(dir_group) - len(keep_indices)} каталогов")
-            else:
-                print("Неверный выбор, пропускаем группу")
-    
-    return files_to_delete, dirs_to_delete
+        print('Неверный выбор')
 
-def auto_select_first_copy(duplicates, identical_dirs):
+
+_MENU = ('  [s] пропустить  [a] оставить первую  [b] оставить последнюю\n'
+         '  [m] выбрать вручную  [A] оставить первую во всех оставшихся')
+
+
+def select_interactive(duplicates: dict, identical_dirs: list,
+                       read: Optional[Callable[[str], str]] = None
+                       ) -> tuple:
+    """Interactively selects files and directories to delete.
+
+    Returns:
+      Tuple (paths_to_delete, dirs_to_delete). Not validated: pass the
+      result to build_plan.
+
+    Raises:
+      EOFError: stdin was closed.
     """
-    Автоматически выбирает правило 'удалить все копии, кроме первой' для всех групп.
+    paths, dirs = [], []
+    auto = False
+    for i, group in enumerate(duplicates.values(), 1):
+        print(f'\nГруппа {i}, размер {format_size(group[0].size)}')
+        for j, entry in enumerate(group, 1):
+            print(f'  [{j}] {safe_text(entry.path)}')
+        if auto:
+            keep = {0}
+        else:
+            print(_MENU)
+            keep, auto = ask_keep(len(group), read)
+        if keep is not None:
+            paths.extend(e.path for k, e in enumerate(group) if k not in keep)
+
+    auto = False
+    for i, group in enumerate(identical_dirs, 1):
+        print(f'\nГруппа идентичных каталогов {i}')
+        for j, dir_path in enumerate(group, 1):
+            print(f'  [{j}] {safe_text(dir_path)}')
+        if auto:
+            keep = {0}
+        else:
+            print(_MENU)
+            keep, auto = ask_keep(len(group), read)
+        if keep is not None:
+            dirs.extend(d for k, d in enumerate(group) if k not in keep)
+    return paths, dirs
+
+
+def select_auto_first(duplicates: dict, identical_dirs: list) -> tuple:
+    """Keeps the first item (by sorted path) of every group."""
+    paths = [e.path for group in duplicates.values() for e in group[1:]]
+    dirs = [d for group in identical_dirs for d in group[1:]]
+    return paths, dirs
+
+
+def build_plan(duplicates: dict, paths_to_delete: Iterable[str],
+               dirs_to_delete: Iterable[str]) -> Plan:
+    """Builds a deletion plan and checks its safety invariants.
+
+    Every file of a directory to delete is added to the deletions. Each
+    deleted file gets a keeper: a surviving copy from the same group.
+
+    Raises:
+      PlanError: A group would lose all copies, or a path is not a known
+        duplicate.
     """
-    files_to_delete = []
-    dirs_to_delete = []
-    
-    # Обработка дубликатов файлов
-    for file_hash, file_paths in duplicates.items():
-        # Оставляем первую копию, остальные удаляем
-        files_to_delete.extend(file_paths[1:])
-    
-    # Обработка идентичных каталогов
-    for dir_group in identical_dirs:
-        # Оставляем первый каталог, остальные удаляем
-        dirs_to_delete.extend(dir_group[1:])
-    
-    return files_to_delete, dirs_to_delete
+    known = {_key(e.path) for g in duplicates.values() for e in g}
+    doomed = {_key(p) for p in paths_to_delete}
+    unknown = doomed - known
+    if unknown:
+        raise PlanError('в плане есть файлы, не являющиеся дубликатами: '
+                        + ', '.join(sorted(safe_text(p) for p in unknown)))
+    dirs = sorted(set(dirs_to_delete))
+    dir_keys = {_key(d) for d in dirs}
+    doomed |= {k for k in known if os.path.dirname(k) in dir_keys}
 
-def preview_deletion(files_to_delete, dirs_to_delete, statistics):
-    """Показывает предварительный просмотр того, что будет удалено."""
-    print("\n" + "="*60)
-    print("ПРЕДВАРИТЕЛЬНЫЙ ПРОСМОТР УДАЛЕНИЯ")
-    print("="*60)
-    
-    total_size_saved = 0
-    
-    if files_to_delete:
-        print(f"\nФайлы для удаления ({len(files_to_delete)}):")
-        total_file_size = sum(os.path.getsize(f) for f in files_to_delete)
-        total_size_saved += total_file_size
-        
-        for file in files_to_delete[:10]:  # Показываем только первые 10
-            print(f"  - {file}")
-        if len(files_to_delete) > 10:
-            print(f"  ... и еще {len(files_to_delete) - 10} файлов")
-        print(f"Общий объем файлов для удаления: {format_size(total_file_size)}")
-    
-    if dirs_to_delete:
-        print(f"\nКаталоги для удаления ({len(dirs_to_delete)}):")
-        total_dir_size = 0
-        for dir_path in dirs_to_delete:
-            if dir_path in statistics['by_directory']:
-                dir_stats = statistics['by_directory'][dir_path]
-                total_dir_size += dir_stats['size']
-                print(f"  - {dir_path} ({dir_stats['count']} файлов, {format_size(dir_stats['size'])})")
-            else:
-                print(f"  - {dir_path} (статистика недоступна)")
-        
-        total_size_saved += total_dir_size
-        print(f"Общий объем каталогов для удаления: {format_size(total_dir_size)}")
-    
-    print(f"\nОбщий объем, который будет освобожден: {format_size(total_size_saved)}")
-    
-    if not files_to_delete and not dirs_to_delete:
-        print("Нет объектов для удаления.")
-        return False
-    
-    return True
+    deletions = []
+    for group in duplicates.values():
+        survivors = [e for e in group if _key(e.path) not in doomed]
+        victims = [e for e in group if _key(e.path) in doomed]
+        if victims and not survivors:
+            raise PlanError('план удаляет все копии группы: '
+                            + ', '.join(safe_text(e.path) for e in group))
+        deletions.extend((victim, survivors[0]) for victim in victims)
+    return Plan(deletions=deletions, dirs=dirs)
 
-def execute_deletion(files_to_delete, dirs_to_delete, dry_run=False):
-    """Выполняет или имитирует удаление выбранных файлов и каталогов."""
-    print("\n" + "="*60)
-    print("ВЫПОЛНЕНИЕ УДАЛЕНИЯ" if not dry_run else "ТЕСТОВЫЙ РЕЖИМ УДАЛЕНИЯ")
-    print("="*60)
-    
-    deleted_files = 0
-    deleted_dirs = 0
-    freed_space = 0
-    
-    # Удаляем файлы
-    for file_path in files_to_delete:
+
+def verify_before_delete(victim: FileEntry,
+                         keeper: FileEntry) -> Optional[str]:
+    """Checks that victim is still a byte-identical copy of keeper.
+
+    Returns:
+      None if deletion is safe, otherwise a reason. OSError propagates.
+    """
+    st = os.lstat(victim.path)
+    if not stat.S_ISREG(st.st_mode):
+        return 'не является обычным файлом'
+    if (st.st_size, st.st_mtime_ns) != (victim.size, victim.mtime_ns):
+        return 'изменён после сканирования'
+    kst = os.lstat(keeper.path)
+    if not stat.S_ISREG(kst.st_mode):
+        return 'сохраняемая копия не является обычным файлом'
+    if st.st_ino and (st.st_dev, st.st_ino) == (kst.st_dev, kst.st_ino):
+        return 'это тот же файл, что и сохраняемая копия'
+    if not filecmp.cmp(keeper.path, victim.path, shallow=False):
+        return 'содержимое отличается от сохраняемой копии'
+    return None
+
+
+def apply_plan(plan: Plan, dry_run: bool = False) -> int:
+    """Executes a plan: verified file deletions, then os.rmdir of dirs.
+
+    Returns:
+      Number of failed steps. Files are never deleted without verification;
+      directories are never removed recursively.
+    """
+    failures = 0
+    deleted = 0
+    freed = 0
+    for victim, keeper in plan.deletions:
+        shown = safe_text(victim.path)
         try:
-            file_size = os.path.getsize(file_path)
-            if not dry_run:
-                os.remove(file_path)
-                print(f"Удален файл: {file_path} ({format_size(file_size)})")
+            reason = verify_before_delete(victim, keeper)
+            if reason:
+                print(f'[SKIP] {shown}: {reason}', file=sys.stderr)
+                failures += 1
+                continue
+            if dry_run:
+                print(f'[DRY-RUN] удалить {shown}')
             else:
-                print(f"[ТЕСТ] Будет удален файл: {file_path} ({format_size(file_size)})")
-            deleted_files += 1
-            freed_space += file_size
-        except Exception as e:
-            print(f"Ошибка при удалении файла {file_path}: {e}")
-    
-    # Удаляем каталоги (только пустые или после удаления файлов)
-    for dir_path in dirs_to_delete:
+                os.remove(victim.path)
+                print(f'Удалён {shown}')
+            deleted += 1
+            freed += victim.size
+        except OSError as err:
+            print(f'[ERROR] {shown}: {err.strerror}', file=sys.stderr)
+            failures += 1
+    for dir_path in plan.dirs:
+        shown = safe_text(dir_path)
+        if dry_run:
+            print(f'[DRY-RUN] удалить пустой каталог {shown}')
+            continue
         try:
-            # Сначала пытаемся получить размер каталога
-            dir_size = 0
-            for root, dirs, files in os.walk(dir_path):
-                for file in files:
-                    try:
-                        dir_size += os.path.getsize(os.path.join(root, file))
-                    except:
-                        pass
-            
-            if not dry_run:
-                shutil.rmtree(dir_path)
-                print(f"Удален каталог: {dir_path} ({format_size(dir_size)})")
-            else:
-                print(f"[ТЕСТ] Будет удален каталог: {dir_path} ({format_size(dir_size)})")
-            deleted_dirs += 1
-            freed_space += dir_size
-        except Exception as e:
-            print(f"Ошибка при удалении каталога {dir_path}: {e}")
-    
-    print(f"\nИтого удалено: {deleted_files} файлов и {deleted_dirs} каталогов")
-    print(f"Освобождено места: {format_size(freed_space)}")
+            os.rmdir(dir_path)
+            print(f'Удалён каталог {shown}')
+        except OSError as err:
+            print(f'[ERROR] каталог {shown} не удалён: {err.strerror}',
+                  file=sys.stderr)
+            failures += 1
+    prefix = 'Будет удалено' if dry_run else 'Удалено'
+    print(f'\n{prefix}: {deleted} файлов, {format_size(freed)}; '
+          f'ошибок: {failures}')
+    return failures
 
-def main():
-    parser = argparse.ArgumentParser(description='Инструмент для анализа и поиска дубликатов медиафайлов.')
-    parser.add_argument('source_dir', help='Путь к корневой директории для анализа')
-    parser.add_argument('--workers', type=int, default=8, help='Количество потоков для обработки (по умолчанию: 8)')
-    parser.add_argument('--cache-file', default='hash_cache.pkl', help='Файл для кэширования хешей (по умолчанию: hash_cache.pkl)')
-    parser.add_argument('--group-by-category', action='store_true', help='Группировать дубликаты по категориям')
-    parser.add_argument('--find-identical-dirs', action='store_true', help='Найти идентичные каталоги')
-    parser.add_argument('--interactive', action='store_true', help='Запустить интерактивный режим выбора для удаления')
-    parser.add_argument('--dry-run', action='store_true', help='Тестовый режим (показать что будет удалено, но не удалять)')
-    parser.add_argument('--auto-first', action='store_true', help='Автоматически применить "удалить все копии, кроме первой" для всех групп')
-    
-    args = parser.parse_args()
 
+def print_section(title: str) -> None:
+    print(f'\n{"=" * 60}\n{title}\n{"=" * 60}')
+
+
+def print_summary(stats: ScanStats) -> None:
+    """Prints scan totals, categories, top extensions and directories."""
+    print_section('СВОДНАЯ СТАТИСТИКА')
+    print(f'Файлов: {stats.total_files}, объём: {format_size(stats.total_size)}')
+    if stats.skipped:
+        print(f'Пропущено необычных объектов (symlink, FIFO и т.п.): '
+              f'{stats.skipped["non_regular"]}')
+
+    print_section('ПО КАТЕГОРИЯМ')
+    for category, data in sorted(stats.by_category.items()):
+        share = data['count'] / stats.total_files * 100
+        print(f'{category.upper():<12} {data["count"]:>7} ({share:5.1f}%) '
+              f'{format_size(data["size"]):>12}')
+
+    print_section('ПО РАСШИРЕНИЯМ (ТОП-15 ПО ОБЪЁМУ)')
+    top_ext = sorted(stats.by_extension.items(),
+                     key=lambda item: item[1]['size'], reverse=True)[:15]
+    for ext, data in top_ext:
+        print(f'{safe_text(ext) or "(нет)":<10} {data["count"]:>7} '
+              f'{format_size(data["size"]):>12}')
+
+    print_section('ПО КАТАЛОГАМ (ТОП-10 ПО ОБЪЁМУ, БЕЗ ПОДКАТАЛОГОВ)')
+    top_dirs = sorted(stats.by_directory.items(),
+                      key=lambda item: item[1]['size'], reverse=True)[:10]
+    for dir_path, data in top_dirs:
+        print(f'{safe_text(dir_path)}: {data["count"]} файлов, '
+              f'{format_size(data["size"])}')
+
+
+def print_duplicates(duplicates: dict, by_category: bool) -> None:
+    """Prints duplicate groups, optionally grouped by category."""
+    wasted = sum(g[0].size * (len(g) - 1) for g in duplicates.values())
+    print_section('ДУБЛИКАТЫ')
+    print(f'Групп: {len(duplicates)}, лишний объём: {format_size(wasted)}')
+    sections = collections.defaultdict(list)
+    for digest, group in duplicates.items():
+        ext = os.path.splitext(group[0].path)[1]
+        key = get_file_category(ext) if by_category else 'все'
+        sections[key].append((digest, group))
+    for section, groups in sorted(sections.items()):
+        if by_category:
+            print_section(f'КАТЕГОРИЯ: {section.upper()}')
+        for i, (digest, group) in enumerate(groups, 1):
+            print(f'\nГруппа {i} ({digest[:8]}), {format_size(group[0].size)}')
+            for entry in group:
+                print(f'  -> {safe_text(entry.path)}')
+
+
+def print_identical_dirs(identical_dirs: list) -> None:
+    print_section('ИДЕНТИЧНЫЕ КАТАЛОГИ (ТОЛЬКО БЕЗ ПОДКАТАЛОГОВ)')
+    for i, group in enumerate(identical_dirs, 1):
+        print(f'\nГруппа {i}')
+        for dir_path in group:
+            print(f'  -> {safe_text(dir_path)}')
+
+
+def print_preview(plan: Plan) -> None:
+    """Prints exactly what apply_plan will attempt to delete."""
+    print_section('ПЛАН УДАЛЕНИЯ')
+    for victim, keeper in plan.deletions[:_PREVIEW_LIMIT]:
+        print(f'  - {safe_text(victim.path)}\n'
+              f'      копия остаётся: {safe_text(keeper.path)}')
+    hidden = len(plan.deletions) - _PREVIEW_LIMIT
+    if hidden > 0:
+        print(f'  ... и ещё {hidden} файлов')
+    for dir_path in plan.dirs:
+        print(f'  каталог (после удаления файлов, только если пуст): '
+              f'{safe_text(dir_path)}')
+    print(f'\nФайлов: {len(plan.deletions)}, каталогов: {len(plan.dirs)}, '
+          f'освободится: {format_size(plan.total_size)}')
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog='duplo', description='Поиск и удаление дубликатов файлов.')
+    parser.add_argument('source_dir', help='каталог для анализа')
+    parser.add_argument('--cache-file', default=default_cache_path(),
+                        help='файл кэша хешей (JSON), по умолчанию %(default)s')
+    parser.add_argument('--no-cache', action='store_true',
+                        help='не читать и не записывать кэш')
+    parser.add_argument('--group-by-category', action='store_true',
+                        help='группировать дубликаты по категориям')
+    parser.add_argument('--find-identical-dirs', action='store_true',
+                        help='искать идентичные каталоги без подкаталогов')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--interactive', action='store_true',
+                      help='интерактивный выбор копий для удаления')
+    mode.add_argument('--auto-first', action='store_true',
+                      help='оставить первую по пути копию в каждой группе')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='показать и проверить план без удаления')
+    parser.add_argument('--version', action='version',
+                        version=f'%(prog)s {__version__}')
+    return parser
+
+
+def main(argv: Optional[list] = None) -> int:
+    """Command-line entry point. Returns the process exit code."""
+    args = build_parser().parse_args(argv)
     if not os.path.isdir(args.source_dir):
-        print(f"Ошибка: Директория '{args.source_dir}' не существует или недоступна")
-        return
+        print(f'Ошибка: каталог не найден: {safe_text(args.source_dir)}',
+              file=sys.stderr)
+        return 2
 
-    # Шаг 1: Сканирование и сбор статистики
-    print(f"\n[+] Начинаем сканирование директории: {args.source_dir}")
-    all_files, statistics = scan_directory(args.source_dir)
+    files, stats = scan_directory(args.source_dir)
+    print_summary(stats)
 
-    # Шаг 2: Вывод сводной информации
-    print_section("СВОДНАя СТАТИСТИКА")
-    print(f"Общее количество файлов: {statistics['total_files']}")
-    print(f"Общий объем данных: {format_size(statistics['total_size'])}")
+    cache = None if args.no_cache else HashCache(args.cache_file)
+    duplicates = find_duplicates(files, cache, stats.errors)
+    if cache:
+        try:
+            cache.save()
+        except OSError as err:
+            print(f'[WARN] Кэш не сохранён: {err}', file=sys.stderr)
 
-    print_section("РАСПРЕДЕЛЕНИЕ ПО КАТЕГОРИЯМ")
-    for category, data in sorted(statistics['by_category'].items()):
-        percentage = (data['count'] / statistics['total_files']) * 100 if statistics['total_files'] > 0 else 0
-        print(f"* {category.upper():<12}: {data['count']:>6} файлов ({percentage:.1f}%), {format_size(data['size']):>10}")
-
-    print_section("ПО ФОРМАТАМ ФАЙЛОВ (ТОП-15)")
-    extensions_sorted = sorted(statistics['by_extension'].items(), 
-                              key=lambda x: x[1]['size'], reverse=True)[:15]
-    for ext, data in extensions_sorted:
-        print(f"* {ext if ext else 'No Extension':<8}: {data['count']:>6} файлов, {format_size(data['size']):>10}")
-
-    print_section("ПО КАТАЛОГАМ (ТОП-10 ПО РАЗМЕРУ)")
-    sorted_dirs = sorted(statistics['by_directory'].items(), 
-                        key=lambda x: x[1]['size'], reverse=True)[:10]
-    for dir_path, data in sorted_dirs:
-        print(f"* {dir_path}: {data['count']} файлов, {format_size(data['size'])}")
-
-    # Шаг 3: Поиск дубликатов с использованием многопоточности и кэширования
-    duplicates = find_duplicates_parallel(all_files, args.workers, args.cache_file)
-    print(f"\n[+] Найдено групп дубликатов: {len(duplicates)}")
-
-    # Шаг 4: Поиск идентичных каталогов
-    identical_dirs = []
-    if args.find_identical_dirs and duplicates:
-        identical_dirs = find_identical_directories(statistics, duplicates)
-        print(f"[+] Найдено групп идентичных каталогов: {len(identical_dirs)}")
-
-    # Шаг 5: Вывод информации о дубликатах
+    identical_dirs = (find_identical_directories(duplicates)
+                      if args.find_identical_dirs else [])
     if duplicates:
-        total_duplicate_size = 0
-        for file_hash, file_paths in duplicates.items():
-            size = os.path.getsize(file_paths[0])
-            total_duplicate_size += size * (len(file_paths) - 1)
-
-        print_section("ОБЩАЯ СТАТИСТИКА ДУБЛИКАТОВ")
-        print(f"Общий объем, занимаемый дубликатами: {format_size(total_duplicate_size)}")
-        
-        # Вывод дубликатов с группировкой по категориям или без
-        if args.group_by_category:
-            print_duplicates_by_category(duplicates)
-        else:
-            print_section("ВСЕ НАЙДЕННЫЕ ДУБЛИКАТЫ")
-            for i, (file_hash, file_paths) in enumerate(duplicates.items(), 1):
-                size = os.path.getsize(file_paths[0])
-                ext = os.path.splitext(file_paths[0])[1].lower()
-                category = get_file_category(ext)
-                
-                print(f"\nГруппа {i} (Хеш: {file_hash[:8]}...), Размер: {format_size(size)}, Категория: {category}")
-                for path in file_paths:
-                    print(f"  -> {path}")
+        print_duplicates(duplicates, args.group_by_category)
     else:
-        print("\n[+] Дубликаты не найдены.")
+        print('\nДубликаты не найдены.')
+    if identical_dirs:
+        print_identical_dirs(identical_dirs)
 
-    # Шаг 6: Интерактивный режим или автоматическое удаление
-    if (args.interactive or args.auto_first) and (duplicates or identical_dirs):
+    if stats.errors:
+        print(f'\n[WARN] Ошибок чтения: {len(stats.errors)}. Эти файлы и '
+              f'каталоги не участвуют в анализе:', file=sys.stderr)
+        for error in stats.errors[:_PREVIEW_LIMIT]:
+            print(f'  {safe_text(error)}', file=sys.stderr)
+
+    if not (args.interactive or args.auto_first):
+        return 0
+    if not duplicates:
+        return 0
+
+    try:
         if args.auto_first:
-            # Автоматический режим - применяем правило для всех групп
-            files_to_delete, dirs_to_delete = auto_select_first_copy(duplicates, identical_dirs)
-            print("\n[+] Автоматически применено правило 'удалить все копии, кроме первой' для всех групп")
+            paths, dirs = select_auto_first(duplicates, identical_dirs)
         else:
-            # Интерактивный режим
-            files_to_delete, dirs_to_delete = interactive_selection(duplicates, identical_dirs, statistics)
-        
-        if preview_deletion(files_to_delete, dirs_to_delete, statistics):
-            if args.dry_run:
-                execute_deletion(files_to_delete, dirs_to_delete, True)
-            else:
-                confirm = input("\nПодтвердите удаление (y/n): ").strip().lower()
-                if confirm == 'y':
-                    execute_deletion(files_to_delete, dirs_to_delete, False)
-                    print("\n[+] Удаление завершено!")
-                else:
-                    print("Удаление отменено.")
-    elif duplicates or identical_dirs:
-        # Если не используется интерактивный режим, просто выводим рекомендации
-        if duplicates:
-            print(f"\nЗапустите с ключом --interactive для управления удалением дубликатов")
-            print(f"Или используйте --auto-first для автоматического применения правила 'удалить все копии, кроме первой'")
-        if identical_dirs:
-            print(f"Запустите с ключом --interactive для управления удалением идентичных каталогов")
+            paths, dirs = select_interactive(duplicates, identical_dirs)
+        plan = build_plan(duplicates, paths, dirs)
+    except EOFError:
+        print('Ошибка: stdin закрыт, выбор невозможен.', file=sys.stderr)
+        return 2
+    except PlanError as err:
+        print(f'Ошибка плана, ничего не удалено: {err}', file=sys.stderr)
+        return 2
 
-    print("\n[+] Анализ завершен.")
+    if plan.is_empty():
+        print('\nНечего удалять.')
+        return 0
+    print_preview(plan)
+    if not args.dry_run:
+        try:
+            confirm = input('\nПодтвердите удаление (y/n): ').strip().lower()
+        except EOFError:
+            confirm = ''
+        if confirm != 'y':
+            print('Удаление отменено.')
+            return 0
+    return 1 if apply_plan(plan, dry_run=args.dry_run) else 0
+
 
 if __name__ == '__main__':
-    main()
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print('\nПрервано.', file=sys.stderr)
+        sys.exit(130)
