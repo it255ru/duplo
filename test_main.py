@@ -322,6 +322,48 @@ def test_apply_plan_dir_with_new_file_not_removed(tmp_path):
     assert (tmp_path / 'B' / 'new.jpg').exists()
 
 
+def test_apply_plan_dir_with_new_subdir_not_removed(tmp_path):
+    for name in ('A', 'B'):
+        _write(tmp_path / name / 'x.jpg', b'X' * 100)
+    _, duplicates = _analyze(tmp_path)
+    plan = duplo.build_plan(duplicates, [], [str(tmp_path / 'B')])
+    _write(tmp_path / 'B' / 'sub' / 'late.jpg', b'late')
+
+    assert duplo.apply_plan(plan) == 1
+    assert (tmp_path / 'B' / 'sub' / 'late.jpg').exists()
+
+
+def test_apply_plan_dir_file_replaced_after_plan_kept(tmp_path):
+    for name in ('A', 'B'):
+        _write(tmp_path / name / 'x.jpg', b'X' * 100)
+    _, duplicates = _analyze(tmp_path)
+    plan = duplo.build_plan(duplicates, [], [str(tmp_path / 'B')])
+    (tmp_path / 'B' / 'x.jpg').write_bytes(b'Y' * 100)
+
+    assert duplo.apply_plan(plan) == 2
+    assert (tmp_path / 'B' / 'x.jpg').read_bytes() == b'Y' * 100
+
+
+def test_apply_plan_dry_run_predicts_dir_not_empty(tmp_path):
+    for name in ('A', 'B'):
+        _write(tmp_path / name / 'x.jpg', b'X' * 100)
+    _, duplicates = _analyze(tmp_path)
+    plan = duplo.build_plan(duplicates, [], [str(tmp_path / 'B')])
+    _write(tmp_path / 'B' / 'new.jpg', b'new')
+
+    assert duplo.apply_plan(plan, dry_run=True) == 1
+    assert _left(tmp_path) == ['A/x.jpg', 'B/new.jpg', 'B/x.jpg']
+
+
+def test_apply_plan_dry_run_empty_dir_predicted_ok(tmp_path):
+    for name in ('A', 'B'):
+        _write(tmp_path / name / 'x.jpg', b'X' * 100)
+    _, duplicates = _analyze(tmp_path)
+    plan = duplo.build_plan(duplicates, [], [str(tmp_path / 'B')])
+
+    assert duplo.apply_plan(plan, dry_run=True) == 0
+
+
 @POSIX_ONLY
 def test_apply_plan_parent_swapped_for_symlink_outside_untouched(tmp_path):
     root = tmp_path / 'root'
