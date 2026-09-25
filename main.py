@@ -553,54 +553,74 @@ def verify_before_delete(victim: FileEntry,
     return None
 
 
+def _delete_file(victim: FileEntry, keeper: FileEntry, plan: Plan,
+                 dry_run: bool) -> bool:
+    """Verifies and deletes one planned file. Returns True on success."""
+    shown = safe_text(victim.path)
+    try:
+        if _parent_moved(victim.path, plan):
+            reason = 'каталог изменился после построения плана'
+        else:
+            reason = verify_before_delete(victim, keeper)
+        if reason:
+            print(f'[SKIP] {shown}: {reason}', file=sys.stderr)
+            return False
+        if dry_run:
+            print(f'[DRY-RUN] удалить {shown}')
+        else:
+            os.remove(victim.path)
+            print(f'Удалён {shown}')
+        return True
+    except OSError as err:
+        print(f'[ERROR] {shown}: {err.strerror}', file=sys.stderr)
+        return False
+
+
+def _remove_dir(dir_path: str, plan: Plan, dry_run: bool) -> bool:
+    """Removes one planned directory if it is empty. Returns True on success.
+
+    os.rmdir fails on a non-empty directory, so anything not covered by the
+    plan keeps the directory in place.
+    """
+    shown = safe_text(dir_path)
+    if dry_run:
+        print(f'[DRY-RUN] удалить пустой каталог {shown}')
+        return True
+    try:
+        if _parent_moved(dir_path, plan) or os.path.islink(dir_path):
+            print(f'[SKIP] каталог {shown}: путь изменился после '
+                  f'построения плана', file=sys.stderr)
+            return False
+        os.rmdir(dir_path)
+        print(f'Удалён каталог {shown}')
+        return True
+    except OSError as err:
+        print(f'[ERROR] каталог {shown} не удалён: {err.strerror}',
+              file=sys.stderr)
+        return False
+
+
 def apply_plan(plan: Plan, dry_run: bool = False) -> int:
     """Executes a plan: verified file deletions, then os.rmdir of dirs.
+
+    Args:
+      plan: Output of build_plan.
+      dry_run: Verify and print, but delete nothing.
 
     Returns:
       Number of failed steps. Files are never deleted without verification;
       directories are never removed recursively.
     """
     failures = 0
-    deleted = 0
     freed = 0
+    deleted = 0
     for victim, keeper in plan.deletions:
-        shown = safe_text(victim.path)
-        try:
-            if _parent_moved(victim.path, plan):
-                reason = 'каталог изменился после построения плана'
-            else:
-                reason = verify_before_delete(victim, keeper)
-            if reason:
-                print(f'[SKIP] {shown}: {reason}', file=sys.stderr)
-                failures += 1
-                continue
-            if dry_run:
-                print(f'[DRY-RUN] удалить {shown}')
-            else:
-                os.remove(victim.path)
-                print(f'Удалён {shown}')
+        if _delete_file(victim, keeper, plan, dry_run):
             deleted += 1
             freed += victim.size
-        except OSError as err:
-            print(f'[ERROR] {shown}: {err.strerror}', file=sys.stderr)
+        else:
             failures += 1
-    for dir_path in plan.dirs:
-        shown = safe_text(dir_path)
-        if dry_run:
-            print(f'[DRY-RUN] удалить пустой каталог {shown}')
-            continue
-        try:
-            if _parent_moved(dir_path, plan) or os.path.islink(dir_path):
-                print(f'[SKIP] каталог {shown}: путь изменился после '
-                      f'построения плана', file=sys.stderr)
-                failures += 1
-                continue
-            os.rmdir(dir_path)
-            print(f'Удалён каталог {shown}')
-        except OSError as err:
-            print(f'[ERROR] каталог {shown} не удалён: {err.strerror}',
-                  file=sys.stderr)
-            failures += 1
+    failures += sum(not _remove_dir(d, plan, dry_run) for d in plan.dirs)
     prefix = 'Будет удалено' if dry_run else 'Удалено'
     print(f'\n{prefix}: {deleted} файлов, {format_size(freed)}; '
           f'ошибок: {failures}')
@@ -712,17 +732,11 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[list[str]] = None) -> int:
-    """Command-line entry point. Returns the process exit code."""
-    args = build_parser().parse_args(argv)
-    if not os.path.isdir(args.source_dir):
-        print(f'Ошибка: каталог не найден: {safe_text(args.source_dir)}',
-              file=sys.stderr)
-        return 2
-
+def _analyze(args: argparse.Namespace
+             ) -> tuple[DuplicateGroups, DirGroups, ScanStats]:
+    """Scans, hashes and groups. Prints the summary; never deletes."""
     files, stats = scan_directory(args.source_dir)
     print_summary(stats)
-
     cache = None if args.no_cache else HashCache(args.cache_file)
     duplicates = find_duplicates(files, cache, stats.errors)
     if cache:
@@ -730,27 +744,39 @@ def main(argv: Optional[list[str]] = None) -> int:
             cache.save()
         except OSError as err:
             print(f'[WARN] Кэш не сохранён: {err}', file=sys.stderr)
-
     identical_dirs = (find_identical_directories(duplicates)
                       if args.find_identical_dirs else [])
+    return duplicates, identical_dirs, stats
+
+
+def _report(duplicates: DuplicateGroups, identical_dirs: DirGroups,
+            stats: ScanStats, by_category: bool) -> None:
+    """Prints found groups and non-fatal read errors."""
     if duplicates:
-        print_duplicates(duplicates, args.group_by_category)
+        print_duplicates(duplicates, by_category)
     else:
         print('\nДубликаты не найдены.')
     if identical_dirs:
         print_identical_dirs(identical_dirs)
-
     if stats.errors:
         print(f'\n[WARN] Ошибок чтения: {len(stats.errors)}. Эти файлы и '
               f'каталоги не участвуют в анализе:', file=sys.stderr)
         for error in stats.errors[:_PREVIEW_LIMIT]:
             print(f'  {safe_text(error)}', file=sys.stderr)
 
-    if not (args.interactive or args.auto_first):
-        return 0
-    if not duplicates:
-        return 0
 
+def _confirmed() -> bool:
+    """Asks for a final 'y'. A closed stdin counts as 'no'."""
+    try:
+        answer = input('\nПодтвердите удаление (y/n): ')
+    except EOFError:
+        return False
+    return answer.strip().lower() == 'y'
+
+
+def _delete(args: argparse.Namespace, duplicates: DuplicateGroups,
+            identical_dirs: DirGroups) -> int:
+    """Selects, validates, previews and applies a plan. Returns exit code."""
     try:
         if args.auto_first:
             paths, dirs = select_auto_first(duplicates, identical_dirs)
@@ -763,20 +789,35 @@ def main(argv: Optional[list[str]] = None) -> int:
     except PlanError as err:
         print(f'Ошибка плана, ничего не удалено: {err}', file=sys.stderr)
         return 2
-
     if plan.is_empty():
         print('\nНечего удалять.')
         return 0
     print_preview(plan)
-    if not args.dry_run:
-        try:
-            confirm = input('\nПодтвердите удаление (y/n): ').strip().lower()
-        except EOFError:
-            confirm = ''
-        if confirm != 'y':
-            print('Удаление отменено.')
-            return 0
+    if not args.dry_run and not _confirmed():
+        print('Удаление отменено.')
+        return 0
     return 1 if apply_plan(plan, dry_run=args.dry_run) else 0
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    """Command-line entry point.
+
+    Args:
+      argv: Arguments without the program name; None means sys.argv[1:].
+
+    Returns:
+      Process exit code, see the module docstring.
+    """
+    args = build_parser().parse_args(argv)
+    if not os.path.isdir(args.source_dir):
+        print(f'Ошибка: каталог не найден: {safe_text(args.source_dir)}',
+              file=sys.stderr)
+        return 2
+    duplicates, identical_dirs, stats = _analyze(args)
+    _report(duplicates, identical_dirs, stats, args.group_by_category)
+    if not (args.interactive or args.auto_first) or not duplicates:
+        return 0
+    return _delete(args, duplicates, identical_dirs)
 
 
 if __name__ == '__main__':
