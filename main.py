@@ -25,12 +25,13 @@ import stat
 import sys
 import tempfile
 import time
+import types
 from collections.abc import Callable, Iterable
 from typing import Optional
 
 __version__ = '0.3.0'
 
-FILE_CATEGORIES = {
+_FILE_CATEGORIES_SPEC = {
     'images': {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp',
                '.raw', '.heic', '.svg', '.ico', '.jpe', '.tif'},
     'videos': {'.mp4', '.avi', '.mov', '.wmv', '.flv', '.mkv', '.webm',
@@ -52,8 +53,11 @@ FILE_CATEGORIES = {
     'fonts': {'.ttf', '.otf', '.woff', '.woff2', '.eot', '.fon'},
     'design': {'.psd', '.ai', '.sketch', '.fig', '.xd', '.indd'},
 }
-_CATEGORY_BY_EXT = {ext: cat for cat, exts in FILE_CATEGORIES.items()
-                    for ext in exts}
+FILE_CATEGORIES = types.MappingProxyType(
+    {cat: frozenset(exts) for cat, exts in _FILE_CATEGORIES_SPEC.items()})
+"""Read-only: category -> extensions. Order defines priority."""
+_CATEGORY_BY_EXT = types.MappingProxyType(
+    {ext: cat for cat, exts in FILE_CATEGORIES.items() for ext in exts})
 _SIZE_UNITS = ('B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB')
 _PREVIEW_LIMIT = 20        # Files listed in the deletion preview and errors.
 _PROGRESS_INTERVAL = 100   # Hashed files between progress updates.
@@ -523,6 +527,9 @@ def verify_before_delete(victim: FileEntry,
         return 'сохраняемая копия не является обычным файлом'
     if st.st_ino and (st.st_dev, st.st_ino) == (kst.st_dev, kst.st_ino):
         return 'это тот же файл, что и сохраняемая копия'
+    # filecmp keeps a module-level result cache keyed by (size, mtime);
+    # clear it so a stale result can never authorize a deletion.
+    filecmp.clear_cache()
     if not filecmp.cmp(keeper.path, victim.path, shallow=False):
         return 'содержимое отличается от сохраняемой копии'
     return None
