@@ -572,12 +572,3 @@ def test_main_closed_stdin_exit_2(tmp_path, monkeypatch):
 
     assert duplo.main([str(tmp_path), '--no-cache', '--interactive']) == 2
     assert _left(tmp_path) == ['a.jpg', 'b.jpg']
-
-
-# --- anti-example (do not copy) --------------------------------------------
-#
-# def test_dedup():
-#     os.system('python main.py /home/anton/photos --auto-first')
-#     assert True
-#
-# Real data, no assertion on the outcome, exit code ignored.
