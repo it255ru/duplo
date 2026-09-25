@@ -229,6 +229,42 @@ def test_ask_keep_invalid_manual_answer_reasked():
     assert duplo.ask_keep(3, lambda _: next(answers)) == ({1}, False)
 
 
+def test_select_interactive_uppercase_a_applies_to_rest(tmp_path):
+    for i in range(3):
+        _write(tmp_path / f'g{i}_1.jpg', bytes([i]) * (10 + i))
+        _write(tmp_path / f'g{i}_2.jpg', bytes([i]) * (10 + i))
+    _, duplicates = _analyze(tmp_path)
+    answers = iter(['A'])
+
+    paths, dirs = duplo.select_interactive(duplicates, [],
+                                           lambda _: next(answers))
+
+    assert sorted(os.path.basename(p) for p in paths) == [
+        'g0_2.jpg', 'g1_2.jpg', 'g2_2.jpg']
+    assert dirs == []
+
+
+def test_select_interactive_file_auto_does_not_leak_to_dirs(tmp_path):
+    for name in ('A', 'B'):
+        _write(tmp_path / name / 'x.jpg', b'X' * 100)
+    _, duplicates = _analyze(tmp_path)
+    identical = duplo.find_identical_directories(duplicates)
+    answers = iter(['A', 's'])
+
+    paths, dirs = duplo.select_interactive(duplicates, identical,
+                                           lambda _: next(answers))
+
+    assert len(paths) == 1
+    assert dirs == []
+
+
+def test_file_categories_read_only():
+    with pytest.raises(TypeError):
+        duplo.FILE_CATEGORIES['new'] = {'.x'}
+    with pytest.raises(AttributeError):
+        duplo.FILE_CATEGORIES['images'].add('.x')
+
+
 def test_build_plan_rejects_deleting_all_copies(tmp_path):
     _write(tmp_path / 'A' / 'x.jpg', b'X' * 100)
     _write(tmp_path / 'B' / 'x.jpg', b'X' * 100)
