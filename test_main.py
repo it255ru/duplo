@@ -457,6 +457,51 @@ def test_hash_cache_roundtrip_stale_entry_ignored(tmp_path):
     assert reloaded.get(stale) is None
 
 
+def test_hash_cache_poisoned_hash_cannot_authorize_deletion(tmp_path):
+    _write(tmp_path / 'data' / 'keep.jpg', b'K' * 64)
+    _write(tmp_path / 'data' / 'other.jpg', b'O' * 64)
+    files, _ = duplo.scan_directory(str(tmp_path / 'data'))
+    cache_file = str(tmp_path / 'cache.json')
+    poisoned = duplo.HashCache(cache_file)
+    for entry in files:
+        poisoned.set(entry, 'same-fake-digest')
+    poisoned.save()
+
+    duplicates = duplo.find_duplicates(files, duplo.HashCache(cache_file), [])
+    group = next(iter(duplicates.values()))
+    plan = duplo.build_plan(duplicates, [group[1].path], [])
+
+    assert duplo.apply_plan(plan) == 1
+    assert _left(tmp_path / 'data') == ['keep.jpg', 'other.jpg']
+
+
+def test_hash_cache_malformed_json_structures_ignored(tmp_path):
+    _write(tmp_path / 'a.jpg', b'X' * 10)
+    files, _ = duplo.scan_directory(str(tmp_path))
+    key = duplo._key(files[0].path)
+    bad_payloads = [
+        '[1, 2, 3]',
+        '{"%s": "not-a-dict"}' % key,
+        '{"%s": {"key": "x", "hash": 1}}' % key,
+        '{"%s": {"key": [10, %d, %d], "hash": 42}}'
+        % (key, files[0].mtime_ns, files[0].ino),
+    ]
+    for payload in bad_payloads:
+        cache_file = tmp_path / 'c.json'
+        cache_file.write_text(payload, encoding='utf-8')
+
+        assert duplo.HashCache(str(cache_file)).get(files[0]) is None
+
+
+def test_hash_cache_old_pickle_file_ignored(tmp_path):
+    cache_file = tmp_path / 'hash_cache.pkl'
+    cache_file.write_bytes(pickle.dumps({'a': {'hash': 'h'}}))
+    _write(tmp_path / 'd' / 'a.jpg', b'X' * 10)
+    files, _ = duplo.scan_directory(str(tmp_path / 'd'))
+
+    assert duplo.HashCache(str(cache_file)).get(files[0]) is None
+
+
 # --- misc -------------------------------------------------------------------
 
 def test_format_size_beyond_terabytes_returns_string():
