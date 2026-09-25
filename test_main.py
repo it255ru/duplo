@@ -322,6 +322,56 @@ def test_apply_plan_dir_with_new_file_not_removed(tmp_path):
     assert (tmp_path / 'B' / 'new.jpg').exists()
 
 
+@POSIX_ONLY
+def test_apply_plan_parent_swapped_for_symlink_outside_untouched(tmp_path):
+    root = tmp_path / 'root'
+    outside = tmp_path / 'outside'
+    _write(root / 'A' / 'x.jpg', b'X' * 100)
+    _write(root / 'B' / 'x.jpg', b'X' * 100)
+    _write(outside / 'x.jpg', b'X' * 100)
+    _, duplicates = _analyze(root)
+    plan = duplo.build_plan(duplicates, [str(root / 'B' / 'x.jpg')], [])
+    victim = plan.deletions[0][0]
+    # Same size and mtime as the victim: only the parent check can stop it.
+    os.utime(outside / 'x.jpg', ns=(victim.mtime_ns, victim.mtime_ns))
+    (root / 'B' / 'x.jpg').unlink()
+    (root / 'B').rmdir()
+    os.symlink(outside, root / 'B')
+
+    assert duplo.apply_plan(plan) == 1
+    assert (outside / 'x.jpg').exists()
+
+
+@POSIX_ONLY
+def test_apply_plan_dir_swapped_for_symlink_not_removed(tmp_path):
+    root = tmp_path / 'root'
+    for name in ('A', 'B'):
+        _write(root / name / 'x.jpg', b'X' * 100)
+    _, duplicates = _analyze(root)
+    plan = duplo.build_plan(duplicates, [], [str(root / 'B')])
+    (root / 'B' / 'x.jpg').unlink()
+    (root / 'B').rmdir()
+    (tmp_path / 'empty').mkdir()
+    os.symlink(tmp_path / 'empty', root / 'B')
+
+    assert duplo.apply_plan(plan) >= 1
+    assert (tmp_path / 'empty').is_dir()
+    assert os.path.islink(root / 'B')
+
+
+def test_main_source_dir_is_symlink_works(tmp_path, monkeypatch):
+    if sys.platform == 'win32':
+        return
+    _write(tmp_path / 'real' / 'a.jpg', b'X' * 10)
+    _write(tmp_path / 'real' / 'b.jpg', b'X' * 10)
+    os.symlink(tmp_path / 'real', tmp_path / 'link')
+
+    code = _run(tmp_path / 'link', '--auto-first', monkeypatch=monkeypatch)
+
+    assert code == 0
+    assert _left(tmp_path / 'real') == ['a.jpg']
+
+
 def test_apply_plan_dry_run_deletes_nothing(tmp_path):
     _write(tmp_path / 'a.jpg', b'X' * 10)
     _write(tmp_path / 'b.jpg', b'X' * 10)
