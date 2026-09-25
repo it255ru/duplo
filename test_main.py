@@ -1,5 +1,6 @@
 """Tests for duplo (main.py). Run: pytest -q test_main.py"""
 
+import json
 import os
 import pickle
 import stat
@@ -484,16 +485,18 @@ def test_hash_cache_malformed_json_structures_ignored(tmp_path):
     _write(tmp_path / 'a.jpg', b'X' * 10)
     files, _ = duplo.scan_directory(str(tmp_path))
     key = duplo._key(files[0].path)
+    right_key = [10, files[0].mtime_ns, files[0].ino]
     bad_payloads = [
-        '[1, 2, 3]',
-        '{"%s": "not-a-dict"}' % key,
-        '{"%s": {"key": "x", "hash": 1}}' % key,
-        '{"%s": {"key": [10, %d, %d], "hash": 42}}'
-        % (key, files[0].mtime_ns, files[0].ino),
+        [1, 2, 3],
+        {key: 'not-a-dict'},
+        {key: {'key': 'x', 'hash': 1}},
+        {key: {'key': right_key, 'hash': 42}},
     ]
     for payload in bad_payloads:
         cache_file = tmp_path / 'c.json'
-        cache_file.write_text(payload, encoding='utf-8')
+        # json.dumps escapes Windows backslashes, so every payload is valid
+        # JSON and exercises the structure checks, not the parser.
+        cache_file.write_text(json.dumps(payload), encoding='utf-8')
 
         assert duplo.HashCache(str(cache_file)).get(files[0]) is None
 
@@ -631,3 +634,11 @@ def test_main_long_path_windows_does_not_crash(tmp_path):
 
     assert duplo.main([str(tmp_path), '--no-cache']) == 0
 
+
+# --- anti-example (do not copy) --------------------------------------------
+#
+# def test_dedup():
+#     os.system('python main.py /home/anton/photos --auto-first')
+#     assert True
+#
+# Real data, no assertion on the outcome, exit code ignored.
